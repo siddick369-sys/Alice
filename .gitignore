@@ -1,0 +1,51 @@
+# Secrets & Credentials (NEVER COMMIT)
+.env
+*.env
+.env.*
+credentials.json
+token.pickle
+token.json
+client_secret*.json
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+*/venv/
+*/.venv/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+*/node_modules/
+dist/
+frontend/dist/
+*/dist/
+.npm
+*.log
+
+# Python cache & artifacts
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.pytest_cache/
+
+# Audio / TTS / Temporary files
+*.mp3
+jarvis_tts_*.mp3
+alice_outputs/
+temp_uploads/
+backups/
+
+# Heavy archives & OCR data
+Install_jarvis.zip
+*.zip
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
