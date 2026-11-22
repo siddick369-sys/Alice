@@ -2,10 +2,13 @@
 .env
 *.env
 .env.*
+!.env.example
 credentials.json
 token.pickle
 token.json
 client_secret*.json
+jarvis_memoire.json
+*.memoire.json
 
 # Virtual Environments
 venv/
