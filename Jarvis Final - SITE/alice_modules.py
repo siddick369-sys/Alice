@@ -658,6 +658,20 @@ class AliceModules:
         Navigue sur un site web de manière autonome en analysant
         visuellement les pages et en simulant des clics.
         """
+        # Validation d'URL et prévention SSRF (LOT C)
+        try:
+            import alice_web_guard
+            safe, reason = alice_web_guard.WEB_GUARD.is_safe_url(url)
+            if not safe:
+                return {
+                    "success": False,
+                    "result": "",
+                    "message": f"Accès refusé par Alice Web Guard : {reason}",
+                    "security_block": True
+                }
+        except ImportError:
+            pass
+
         if not self.gemini_client:
             return {"success": False, "result": "", "message": "Client Gemini non disponible."}
 
@@ -982,11 +996,29 @@ class AliceModules:
     async def indexer_knowledge_base(self, knowledge_dir: str) -> dict:
         """
         Indexe tous les documents du dossier knowledge/ pour la recherche sémantique
-        en utilisant les embeddings HuggingFace.
+        en utilisant le moteur local AliceRAGEngine (TXT, MD, PDF, XLSX).
         """
-        if not self.hf_client:
-            return {"success": False, "count": 0, "message": "Client HF non disponible."}
+        try:
+            import alice_rag
+            res = alice_rag.RAG_ENGINE.index_knowledge_directory()
+            self._vector_store = {
+                c["chunk_id"]: {
+                    "file": c["source_file"],
+                    "text": c["text"],
+                    "chunk_id": c.get("chunk_id", ""),
+                    "citation": c.get("provenance", "")
+                }
+                for c in alice_rag.RAG_ENGINE.chunks
+            }
+            return {
+                "success": True,
+                "count": len(self._vector_store),
+                "message": f"{len(self._vector_store)} chunks indexés depuis {knowledge_dir} (moteur AliceRAGEngine)."
+            }
+        except Exception as e:
+            print(f"[KB] Erreur indexation AliceRAGEngine : {e}")
 
+        # Fallback local autonome
         count = 0
         kb_path = Path(knowledge_dir)
         if not kb_path.exists():
@@ -1020,8 +1052,28 @@ class AliceModules:
     async def recherche_semantique(self, query: str, top_k: int = 3) -> dict:
         """
         Recherche sémantique dans la base de connaissances.
-        Utilise le feature extraction de HuggingFace pour les embeddings.
+        Priorité au moteur AliceRAGEngine avec scoring TF-IDF / N-grammes et citations.
         """
+        try:
+            import alice_rag
+            results = alice_rag.RAG_ENGINE.search(query, top_k=top_k)
+            if results:
+                return {
+                    "success": True,
+                    "results": [
+                        {
+                            "file": r["source_file"],
+                            "text": r["text"][:300],
+                            "score": r["score"],
+                            "citation": r["citation"]
+                        }
+                        for r in results
+                    ],
+                    "message": f"{len(results)} résultat(s) trouvé(s) pour '{query}'"
+                }
+        except Exception as e:
+            print(f"[RAG] Fallback recherche semantique : {e}")
+
         if not self._vector_store:
             return {"success": False, "results": [], "message": "Base de connaissances vide. Lancez d'abord l'indexation."}
 
@@ -1048,7 +1100,7 @@ class AliceModules:
                 "file": doc["file"],
                 "text": doc["text"][:300],
                 "score": score,
-                "chunk_id": doc["chunk_id"]
+                "chunk_id": doc.get("chunk_id", 0)
             })
 
         if results:

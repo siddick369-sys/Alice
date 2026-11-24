@@ -36,7 +36,7 @@
       <b>⚠️ Microphone bloqué par Chrome (HTTP)</b><br><br>
       1. Tapez <b>chrome://flags</b> dans la barre d'adresse de ce navigateur.<br>
       2. Cherchez <b>Insecure origins treated as secure</b>.<br>
-      3. Ajoutez <b>http://192.168.1.23:8080</b> et activez (Enable).<br>
+      3. Ajoutez l'URL de votre serveur (ex: <b>http://&lt;IP_SERVEUR&gt;:8080</b>) et activez (Enable).<br>
       4. Relancez le navigateur.
     </div>
 
@@ -53,6 +53,21 @@
       </div>
     </div>
 
+    <!-- Modal de confirmation interactive d'action sensible (LOT A / E) -->
+    <div id="action-confirm-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(10, 12, 24, 0.95); z-index: 2050; flex-direction: column; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box;">
+      <div style="background: #161b33; border: 1px solid #f59e0b; border-radius: 12px; padding: 24px; max-width: 360px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(245, 158, 11, 0.3);">
+        <div style="font-size: 32px; margin-bottom: 10px;">⚠️</div>
+        <h2 style="color: #fff; margin-top: 0; font-family: sans-serif; font-size: 18px;">Confirmation Requise</h2>
+        <p id="confirm-modal-prompt" style="color: #ddd; font-size: 14px; font-family: sans-serif; margin-bottom: 20px;">
+          Une action sensible requiert votre confirmation.
+        </p>
+        <div style="display: flex; gap: 10px; justify-content: center;">
+          <button id="confirm-action-btn" style="flex: 1; padding: 12px; background: #22c55e; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;">Confirmer</button>
+          <button id="cancel-action-btn" style="flex: 1; padding: 12px; background: #ef4444; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;">Annuler</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Contenu principal -->
     <main id="app">
 
@@ -63,6 +78,15 @@
 
       <!-- Texte de statut -->
       <div id="status-text">en attente</div>
+
+      <!-- Carte d'état de commande en temps réel (Cycle de vie 9 états) -->
+      <div id="command-status-card" class="command-status-card" style="display: none;">
+        <div class="command-status-header">
+          <span id="command-state-pill" class="state-pill">IDLE</span>
+          <span id="command-action-name" class="action-name"></span>
+        </div>
+        <div id="command-status-detail" class="command-status-detail"></div>
+      </div>
 
       <!-- Zone de transcription (ce que l'utilisateur a dit) -->
       <div id="user-text" class="speech-bubble user-bubble"></div>

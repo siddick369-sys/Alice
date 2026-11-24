@@ -278,3 +278,101 @@ body.state-listening #mic-label { color: rgba(34,197,94,0.6); }
   #orb-container { height: 150px; }
   #app { padding: 60px 20px 28px; }
 }
+
+/* ── Carte de suivi du cycle de vie de commande (LOT A / E) ── */
+.command-status-card {
+  max-width: 340px;
+  width: 90%;
+  margin: 8px auto;
+  padding: 8px 14px;
+  background: rgba(16, 22, 44, 0.85);
+  border: 1px solid rgba(76, 168, 232, 0.35);
+  border-radius: 10px;
+  backdrop-filter: blur(10px);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  transition: all 0.25s ease-in-out;
+  text-align: center;
+  z-index: 10;
+}
+
+.command-status-header {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.state-pill {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  text-transform: uppercase;
+  background: var(--blue-dim);
+  color: var(--blue);
+  border: 1px solid var(--blue-glow);
+}
+
+.state-pill.pill-received, .state-pill.pill-validating, .state-pill.pill-accepted {
+  background: rgba(14, 165, 233, 0.2);
+  color: #38bdf8;
+  border-color: rgba(14, 165, 233, 0.5);
+}
+
+.state-pill.pill-running {
+  background: rgba(59, 130, 246, 0.25);
+  color: #60a5fa;
+  border-color: rgba(59, 130, 246, 0.7);
+  animation: pulse-border 1.5s infinite;
+}
+
+.state-pill.pill-succeeded {
+  background: rgba(34, 197, 94, 0.2);
+  color: #4ade80;
+  border-color: rgba(34, 197, 94, 0.6);
+}
+
+.state-pill.pill-failed {
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.6);
+}
+
+.state-pill.pill-unknown {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.6);
+}
+
+.state-pill.pill-requires_confirmation {
+  background: rgba(234, 179, 8, 0.25);
+  color: #fde047;
+  border-color: rgba(234, 179, 8, 0.8);
+  animation: pulse-border 1s infinite;
+}
+
+.state-pill.pill-cancelled {
+  background: rgba(148, 163, 184, 0.2);
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.5);
+}
+
+.action-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.command-status-detail {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  word-break: break-word;
+}
+
+@keyframes pulse-border {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.03); }
+}

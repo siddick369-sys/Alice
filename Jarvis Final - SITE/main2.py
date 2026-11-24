@@ -49,6 +49,18 @@ import PyPDF2
 import pyttsx3
 import vision_ocr
 import alice_modules
+import alice_orchestrator
+from alice_orchestrator import (
+    ORCHESTRATOR, STATE_RECEIVED, STATE_VALIDATING, STATE_ACCEPTED,
+    STATE_RUNNING, STATE_SUCCEEDED, STATE_FAILED, STATE_UNKNOWN,
+    STATE_CANCELLED, STATE_REQUIRES_CONFIRMATION
+)
+import alice_rag
+from alice_rag import RAG_ENGINE
+import alice_web_guard
+from alice_web_guard import WEB_GUARD
+import alice_google_adapter
+from alice_google_adapter import GOOGLE_ADAPTER
 
 # Google APIs
 from google.oauth2.credentials import Credentials
@@ -317,13 +329,18 @@ def supprimer_memoire(cle):
 
 def charger_contexte_rag():
     contexte = ""
-    fichiers_trouves = False
-    
-    if os.path.exists(KNOWLEDGE_DIR):
+    try:
+        rag_ctx = RAG_ENGINE.build_rag_context("general")
+        if rag_ctx:
+            contexte += rag_ctx + "\n"
+    except Exception as e:
+        print(f"[RAG ENGINE CONTEXT ERROR] {e}")
+
+    # Fallback si RAG engine vide
+    if not contexte and os.path.exists(KNOWLEDGE_DIR):
         contexte += "DOCUMENTS DE CONNAISSANCE (RAG) :\n"
         for chemin in Path(KNOWLEDGE_DIR).glob("**/*"):
-            if chemin.suffix.lower() in [".txt", ".pdf"]:
-                fichiers_trouves = True
+            if chemin.suffix.lower() in [".txt", ".pdf", ".md", ".xlsx"]:
                 contenu = extraire_texte_doc(str(chemin))
                 if contenu:
                     contexte += f"--- DEBUT DOCUMENT: {chemin.name} ---\n{contenu}\n--- FIN DOCUMENT: {chemin.name} ---\n\n"
@@ -338,7 +355,7 @@ def charger_contexte_rag():
                 contexte += f"- {k}: {v}\n"
         contexte += "\n"
 
-    return contexte if (fichiers_trouves or bool(mem)) else ""
+    return contexte.strip()
 
 HA_HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
@@ -619,6 +636,91 @@ class PairingManager:
 PAIRING_MANAGER = PairingManager()
 
 # ==========================================
+# CONFIGURATION RÉSEAU CENTRALISÉE (P1 / Hardening 006)
+# ==========================================
+class NetworkConfig:
+    def __init__(self, bind_address: str, http_port: int, ws_bind_address: str, ws_port: int, trusted_proxies: set):
+        self.bind_address = bind_address
+        self.http_port = http_port
+        self.ws_bind_address = ws_bind_address
+        self.ws_port = ws_port
+        self.trusted_proxies = trusted_proxies
+
+    @property
+    def http_host(self) -> str:
+        return self.bind_address
+
+    @property
+    def ws_host(self) -> str:
+        return self.ws_bind_address
+
+def get_network_config() -> NetworkConfig:
+    """
+    Centralise et valide la configuration réseau pour HTTP et WebSocket (P1 / Hardening 006).
+    Supporte les topologies :
+      - Topologie A (Reverse proxy local) : ALICE_BIND_ADDRESS="127.0.0.1"
+      - Topologie B (Reverse proxy distant) : ALICE_BIND_ADDRESS="<ip_lan>", ALICE_TRUSTED_PROXIES="<proxy_ip>"
+      - Topologie C (Accès direct mobile LAN) : ALICE_BIND_ADDRESS="0.0.0.0"
+    """
+    raw_bind = os.environ.get("ALICE_BIND_ADDRESS") or os.environ.get("JARVIS_BIND_ADDRESS") or "0.0.0.0"
+    raw_bind = raw_bind.strip()
+    try:
+        ipaddress.ip_address(raw_bind)
+        bind_address = raw_bind
+    except ValueError:
+        bind_address = "0.0.0.0"
+
+    raw_http_port = os.environ.get("ALICE_HTTP_PORT") or os.environ.get("JARVIS_HTTP_PORT") or "8080"
+    try:
+        http_port = int(str(raw_http_port).strip())
+        if not (1 <= http_port <= 65535):
+            http_port = 8080
+    except ValueError:
+        http_port = 8080
+
+    raw_ws_bind = os.environ.get("ALICE_WS_BIND_ADDRESS") or os.environ.get("JARVIS_WS_BIND_ADDRESS") or bind_address
+    raw_ws_bind = raw_ws_bind.strip()
+    try:
+        ipaddress.ip_address(raw_ws_bind)
+        ws_bind_address = raw_ws_bind
+    except ValueError:
+        ws_bind_address = bind_address
+
+    raw_ws_port = os.environ.get("ALICE_WS_PORT") or os.environ.get("JARVIS_WS_PORT") or "8765"
+    try:
+        ws_port = int(str(raw_ws_port).strip())
+        if not (1 <= ws_port <= 65535):
+            ws_port = 8765
+    except ValueError:
+        ws_port = 8765
+
+    if http_port == ws_port:
+        ws_port = 8765 if http_port != 8765 else 8766
+
+    raw_proxies = os.environ.get("ALICE_TRUSTED_PROXIES") or "127.0.0.1,::1"
+    trusted_proxies = set()
+    for p in raw_proxies.split(","):
+        p_clean = p.strip()
+        if p_clean:
+            try:
+                if "/" in p_clean:
+                    ipaddress.ip_network(p_clean, strict=False)
+                    trusted_proxies.add(p_clean)
+                else:
+                    ipaddress.ip_address(p_clean)
+                    trusted_proxies.add(p_clean)
+            except ValueError:
+                pass
+
+    return NetworkConfig(
+        bind_address=bind_address,
+        http_port=http_port,
+        ws_bind_address=ws_bind_address,
+        ws_port=ws_port,
+        trusted_proxies=trusted_proxies
+    )
+
+# ==========================================
 # WEBSOCKET & SESSION HARDENING (SEC-04 & SEC-02)
 # ==========================================
 class WSSessionManager:
@@ -633,19 +735,22 @@ class WSSessionManager:
         # Session desktop locale par défaut (générée en mémoire au démarrage, sans écriture sur disque)
         self.desktop_session_id = "desktop_local"
         self.desktop_token = secrets.token_urlsafe(32)
+        self.desktop_csrf = secrets.token_hex(16)
         self.register_session(
             session_id=self.desktop_session_id,
             token=self.desktop_token,
+            csrf_token=self.desktop_csrf,
             client_type="desktop",
             client_ip="127.0.0.1",
             ttl=86400.0 * 30
         )
 
-    def register_session(self, session_id: str, token: str, client_type: str = "mobile", client_ip: str = "unknown", ttl: Optional[float] = None) -> bool:
+    def register_session(self, session_id: str, token: str, csrf_token: Optional[str] = None, client_type: str = "mobile", client_ip: str = "unknown", ttl: Optional[float] = None) -> bool:
         with self.lock:
             expires_at = time.time() + (ttl or self.session_ttl)
             self.sessions[session_id] = {
                 "token": token,
+                "csrf_token": csrf_token or secrets.token_hex(16),
                 "client_type": client_type,
                 "client_ip": client_ip,
                 "created_at": time.time(),
@@ -670,6 +775,19 @@ class WSSessionManager:
                 session["last_seen"] = time.time()
                 return True
             return False
+
+    validate_session = verify_session
+
+    def verify_csrf(self, session_id: str, csrf_token: str) -> bool:
+        """Valide le jeton CSRF associé à une session active (P1 / Hardening 006)."""
+        if not session_id or not csrf_token or not isinstance(csrf_token, str):
+            return False
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session or time.time() > session["expires_at"]:
+                return False
+            stored_csrf = session.get("csrf_token")
+            return bool(stored_csrf and hmac.compare_digest(stored_csrf, csrf_token))
 
     def revoke_session(self, session_id: str, token: Optional[str] = None) -> bool:
         with self.lock:
@@ -750,7 +868,8 @@ class WSSessionManager:
         )
 
         # Ports autorisés pour le serveur local et dev-server
-        ALLOWED_PORTS = {8080, 8443, 8765}
+        net_cfg = get_network_config()
+        ALLOWED_PORTS = {8080, 8443, 8765, net_cfg.http_port, net_cfg.ws_port}
         if not is_production:
             ALLOWED_PORTS.update({5173, 3000})
 
@@ -794,6 +913,7 @@ class WSSessionManager:
             return False
 
 WS_SESSION_MANAGER = WSSessionManager()
+is_origin_allowed = WS_SESSION_MANAGER.is_origin_allowed
 CONNECTED_CLIENTS = set()
 interface_deja_connectee = False
 _skip_pc_audio = False  # True quand la commande vient du mobile (le tél gère son propre TTS)
@@ -826,7 +946,7 @@ async def ws_handler(websocket):
         await websocket.close(code=4003, reason="Forbidden Origin")
         return
 
-    # 3. Authentification et Session
+    # 3. Authentification et Session (P1 / Hardening 006)
     client_ip = "127.0.0.1"
     if websocket.remote_address and len(websocket.remote_address) > 0:
         client_ip = websocket.remote_address[0]
@@ -841,7 +961,39 @@ async def ws_handler(websocket):
         session_id = "desktop_local"
         websocket.session_id = session_id
 
-    # Pour les connexions distantes (LAN), exiger impérativement une authentification sous 5s
+    # 3.1. Tentative d'authentification par Cookie HttpOnly (Handshake WebSocket RFC 6455)
+    if not authenticated:
+        cookie_hdr = None
+        try:
+            if hasattr(websocket, "request") and websocket.request and hasattr(websocket.request, "headers"):
+                cookie_hdr = websocket.request.headers.get("Cookie")
+            elif hasattr(websocket, "request_headers"):
+                cookie_hdr = websocket.request_headers.get("Cookie")
+        except Exception:
+            pass
+
+        if cookie_hdr:
+            import http.cookies
+            try:
+                cookies = http.cookies.SimpleCookie(cookie_hdr)
+                if "alice_session" in cookies:
+                    c_val = cookies["alice_session"].value
+                    if ":" in c_val:
+                        c_sid, c_tok = c_val.split(":", 1)
+                        if WS_SESSION_MANAGER.verify_session(c_sid, c_tok):
+                            authenticated = True
+                            session_id = c_sid
+                            websocket.session_id = session_id
+                            await websocket.send(json.dumps({
+                                "type": "auth_ok",
+                                "session_id": session_id,
+                                "auth_method": "cookie",
+                                "message": "Authentification réussie via cookie sécurisé HttpOnly"
+                            }))
+            except Exception as e:
+                print(f"[WS SECURITY] Erreur parsing cookie WebSocket : {e}")
+
+    # 3.2. Pour les connexions distantes sans cookie valide, exiger poignée de main explicite sous 5s
     if not authenticated:
         try:
             auth_msg = await asyncio.wait_for(websocket.recv(), timeout=5.0)
@@ -902,9 +1054,43 @@ async def ws_handler(websocket):
 
                 if msg_type == "mobile_command":
                     texte = data.get("text", "").strip()
+                    cmd_id = data.get("command_id")
                     if texte:
-                        print(f"[MOBILE] Commande reçue : {texte}")
-                        asyncio.ensure_future(traiter_reponse_ia(texte, mobile_ws=websocket))
+                        # 1. Vérification d'idempotence (anti-double tap)
+                        existing = ORCHESTRATOR.check_idempotency(texte, session_id)
+                        if existing:
+                            print(f"[ORCHESTRATOR] Commande dupliquée détectée ({existing.command_id}), réémission de l'état {existing.state}")
+                            await websocket.send(json.dumps(existing.to_dict(), ensure_ascii=False))
+                            continue
+
+                        # 2. Enregistrement commande et émission RECEIVED
+                        record = ORCHESTRATOR.register_command(texte, session_id, client_ip=client_ip, command_id=cmd_id)
+                        await websocket.send(json.dumps(record.to_dict(), ensure_ascii=False))
+                        print(f"[MOBILE] Commande reçue [{record.command_id}] : {texte}")
+                        asyncio.ensure_future(traiter_reponse_ia(texte, mobile_ws=websocket, command_id=record.command_id))
+
+                elif msg_type == "confirm_action":
+                    cmd_id = data.get("command_id", "")
+                    token = data.get("confirmation_token", "")
+                    confirmed = bool(data.get("confirmed", False))
+
+                    if confirmed:
+                        valid, msg = ORCHESTRATOR.verify_confirmation(cmd_id, token, session_id)
+                        if valid:
+                            await ORCHESTRATOR.transition(cmd_id, STATE_ACCEPTED, websocket=websocket)
+                            await ORCHESTRATOR.transition(cmd_id, STATE_RUNNING, websocket=websocket)
+                            rec = ORCHESTRATOR.commands.get(cmd_id)
+                            action_name = rec.action if rec else "action"
+                            print(f"[ORCHESTRATOR] Action confirmée par l'utilisateur : {action_name}")
+                            await ORCHESTRATOR.transition(cmd_id, STATE_SUCCEEDED, result=f"Action '{action_name}' confirmée et validée.", websocket=websocket)
+                            await parler(f"Action {action_name} confirmée avec succès.")
+                        else:
+                            await ORCHESTRATOR.transition(cmd_id, STATE_FAILED, error=msg, websocket=websocket)
+                            await parler(msg)
+                    else:
+                        ORCHESTRATOR.cancel_confirmation(cmd_id, session_id)
+                        await ORCHESTRATOR.transition(cmd_id, STATE_CANCELLED, websocket=websocket)
+                        await parler("Action annulée, aucune modification n'a été effectuée.")
 
                 elif msg_type == "stop_audio":
                     global STOP_PARLER
@@ -2501,32 +2687,6 @@ def update_productivity(points=10):
     leveled_up = (new_level > PROD_LEVEL)
     PROD_LEVEL = new_level
     return leveled_up, PROD_SCORE, PROD_LEVEL
-
-def diagnostic_pc():
-    """Effectue un check-up santé du PC."""
-    try:
-        cpu_load = psutil.cpu_percent(interval=None)
-        ram_usage = psutil.virtual_memory().percent
-        disk = psutil.disk_usage('C:\\').percent
-        rapport = {"cpu": cpu_load, "ram": ram_usage, "disk": disk, "status": "OK"}
-        alertes = []
-        if cpu_load > 90: alertes.append("Processeur en surcharge.")
-        if ram_usage > 90: alertes.append("Mémoire saturée.")
-        if disk > 95: alertes.append("Disque dur C plein.")
-        if alertes:
-            rapport["status"] = "ALERTE"
-            rapport["details"] = " ".join(alertes)
-        return rapport
-    except: return None
-
-def update_productivity(points=10):
-    """Met à jour le score de productivité d'Alice."""
-    global PROD_SCORE, PROD_LEVEL
-    PROD_SCORE += points
-    new_level = (PROD_SCORE // 100) + 1
-    leveled_up = (new_level > PROD_LEVEL)
-    PROD_LEVEL = new_level
-    return leveled_up, PROD_SCORE, PROD_LEVEL
 async def parler(texte):
     global is_speaking, speak_volume, STOP_PARLER, _skip_pc_audio, historique
     
@@ -3185,10 +3345,21 @@ async def action_whatsapp_appel(contact):
         await parler(f"Desole Aboubakar Ibrahim Siddick, je n'ai pas pu lancer l'appel WhatsApp. {e}")
         return False
 
-async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
+async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None, command_id=None):
     global MODE_IRON_MAN, jarvis_actif, dernier_message, _skip_pc_audio
     # Reset du flag audio au début de chaque commande
     _skip_pc_audio = False
+
+    session_id = getattr(mobile_ws, "session_id", "desktop_local") if mobile_ws else "desktop_local"
+    client_ip = mobile_ws.remote_address[0] if (mobile_ws and mobile_ws.remote_address and len(mobile_ws.remote_address) > 0) else "local"
+
+    # Enregistrement orchestrateur si non fourni (ex: appel vocal local)
+    if not command_id:
+        record = ORCHESTRATOR.register_command(texte_utilisateur, session_id, client_ip=client_ip)
+        command_id = record.command_id
+
+    # Notification validation en cours
+    await ORCHESTRATOR.transition(command_id, STATE_VALIDATING, websocket=mobile_ws)
 
     # 1. RÉSOLUTION LOCALE
     reponse = resoudre_math_localement(texte_utilisateur)
@@ -3197,14 +3368,19 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
     if not reponse: reponse = resoudre_traduction_localement(texte_utilisateur)
     
     if reponse:
+        await ORCHESTRATOR.transition(command_id, STATE_ACCEPTED, action="local_solver", websocket=mobile_ws)
+        await ORCHESTRATOR.transition(command_id, STATE_RUNNING, action="local_solver", websocket=mobile_ws)
+        await ORCHESTRATOR.transition(command_id, STATE_SUCCEEDED, action="local_solver", result=reponse, websocket=mobile_ws)
         await parler(reponse)
         return
 
     # 1.1 ACTIONS SYSTÈME ET CONTRÔLE PC (SEC-03 avec isolation de session)
-    session_id = getattr(mobile_ws, "session_id", "desktop_local") if mobile_ws else "desktop_local"
-    client_ip = mobile_ws.remote_address[0] if (mobile_ws and mobile_ws.remote_address and len(mobile_ws.remote_address) > 0) else "local"
     action_pc = executer_action_pc(texte_utilisateur, session_id=session_id, client_ip=client_ip)
     if action_pc:
+        if "Confirmez" in action_pc or "confirmer" in action_pc:
+            await ORCHESTRATOR.transition(command_id, STATE_REQUIRES_CONFIRMATION, action="system_control", confirmation_prompt=action_pc, websocket=mobile_ws)
+        else:
+            await ORCHESTRATOR.transition(command_id, STATE_SUCCEEDED, action="system_control", result=action_pc, websocket=mobile_ws)
         await parler(action_pc)
         return
 
@@ -3266,6 +3442,7 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
     
     if not json_blocks:
         _skip_pc_audio = False
+        await ORCHESTRATOR.transition(command_id, STATE_SUCCEEDED, action="conversation", result=full_response, websocket=mobile_ws)
         return
 
     for block in json_blocks:
@@ -3274,6 +3451,10 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
             # Timeout de 15s pour chaque action pour eviter de freezer Jarvis
             data = json.loads(block)
             action = data.get("action", "")
+
+            # Notification transition ACCEPTED et RUNNING
+            await ORCHESTRATOR.transition(command_id, STATE_ACCEPTED, action=action, payload=data, websocket=mobile_ws)
+            await ORCHESTRATOR.transition(command_id, STATE_RUNNING, action=action, websocket=mobile_ws)
             
             # On execute l'action avec un timeout
             try:
@@ -3398,6 +3579,7 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
 
                 # C-04 / SEC-05 : Distinguo strict entre acceptation et état physique vérifié
                 if status == HA_FAILED:
+                    await ORCHESTRATOR.transition(command_id, STATE_FAILED, action=action, error="Échec commande Home Assistant ou appareil injoignable", websocket=mobile_ws)
                     await parler(f"Impossible d'actionner la lumière de {piece} : la commande Home Assistant a échoué ou l'appareil est injoignable.")
                 elif status == HA_STATE_VERIFIED:
                     if etat == "off":
@@ -3410,10 +3592,13 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
                             details.append(f"à {pourcent}%")
                         det_str = f" {' '.join(details)}" if details else ""
                         msg = f"C'est fait, lumière {piece} allumée{det_str}. État matériel vérifié."
+                    await ORCHESTRATOR.transition(command_id, STATE_SUCCEEDED, action=action, result=msg, websocket=mobile_ws)
                     await parler(msg)
                 elif status == HA_STATE_UNKNOWN:
+                    await ORCHESTRATOR.transition(command_id, STATE_UNKNOWN, action=action, error="État réel de l'ampoule indéterminé", websocket=mobile_ws)
                     await parler(f"L'ordre pour la lumière de {piece} a été transmis, mais l'état réel de l'ampoule reste indéterminé.")
                 else: # TIMEOUT ou REQUEST_ACCEPTED avec état non confirmé
+                    await ORCHESTRATOR.transition(command_id, STATE_UNKNOWN, action=action, error=f"Appareil {piece} signale toujours : {actual_state}", websocket=mobile_ws)
                     await parler(f"Attention : l'ordre a été envoyé à Home Assistant, mais l'appareil {piece} signale toujours l'état : {actual_state}.")
 
             elif action == "ha_prise":
@@ -3425,13 +3610,17 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
                 actual_state = result.get("state") if isinstance(result, dict) else "unknown"
 
                 if status == HA_FAILED:
+                    await ORCHESTRATOR.transition(command_id, STATE_FAILED, action=action, error="Échec commande prise", websocket=mobile_ws)
                     await parler(f"Impossible d'actionner la prise de {piece} : la commande Home Assistant a échoué.")
                 elif status == HA_STATE_VERIFIED:
                     msg = f"Prise {piece} {'activée' if etat == 'on' else 'désactivée'}. État matériel vérifié."
+                    await ORCHESTRATOR.transition(command_id, STATE_SUCCEEDED, action=action, result=msg, websocket=mobile_ws)
                     await parler(msg)
                 elif status == HA_STATE_UNKNOWN:
+                    await ORCHESTRATOR.transition(command_id, STATE_UNKNOWN, action=action, error="État réel de la prise indéterminé", websocket=mobile_ws)
                     await parler(f"L'ordre pour la prise {piece} a été transmis, mais l'état réel de l'équipement reste indéterminé.")
                 else:
+                    await ORCHESTRATOR.transition(command_id, STATE_UNKNOWN, action=action, error=f"Prise signale toujours : {actual_state}", websocket=mobile_ws)
                     await parler(f"Attention : l'ordre a été envoyé pour la prise {piece}, mais l'équipement signale toujours l'état : {actual_state}.")
             elif action == "ha_temperature":
                 piece     = data.get("piece", "salon")
@@ -3985,8 +4174,12 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
             if leveled_up:
                 await parler(f" Félicitations ! Vous venez de passer au niveau {level} de productivité !")
 
+            # Notification transition SUCCEEDED (LOT A / E)
+            await ORCHESTRATOR.transition(command_id, STATE_SUCCEEDED, action=action, websocket=mobile_ws)
+
         except Exception as e:
             print(f"[ACTION ERROR] Block failed: {block} | Error: {e}")
+            await ORCHESTRATOR.transition(command_id, STATE_FAILED, action=action, error=str(e), websocket=mobile_ws)
             if grok_client:
                 print("[JARVIS] Bascule sur Grok suite a une erreur d'action...")
                 res_grok = await demander_grok(f"Aboubakar Ibrahim Siddick m'a demandé : {texte_utilisateur}. J'ai tenté de lancer une action mais j'ai eu une erreur technique ({e}). Peux-tu prendre le relais et lui répondre élégamment ?")
@@ -4229,18 +4422,25 @@ def start_ia():
     threading.Thread(target=monitor_calendar, daemon=True).start()
     threading.Thread(target=monitor_system, daemon=True).start()
     
-    liberer_port(8765) # On s'assure que le port est libre
+    net_cfg = get_network_config()
+    liberer_port(net_cfg.ws_port)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    threading.Thread(target=lambda: asyncio.run(start_ws()), daemon=True).start()
+
+    loop.run_until_complete(parler("Bonjour, Aboubakar Ibrahim Siddick"))
+    loop.close()
+    ecouter()
+
 # ==========================================
-# CONFIGURATION TLS/WSS & SÉCURITÉ DE TRANSPORT (C-01)
+# CONFIGURATION TLS/WSS & SÉCURITÉ DE TRANSPORT (C-01 & P1)
 # ==========================================
 TRUSTED_PROXIES = set(os.environ.get("ALICE_TRUSTED_PROXIES", "127.0.0.1,::1").split(","))
 
 def get_ssl_context(purpose="server") -> Optional[ssl.SSLContext]:
     """
-    Configure et charge un contexte SSL/TLS serveur pour HTTPS (port 8080) et WSS (port 8765) (C-01).
+    Configure et charge un contexte SSL/TLS serveur pour HTTPS et WSS (C-01 / P1).
     Prend en charge les chemins configurés par variables d'environnement ou le dossier certs/.
     """
     cert_path = os.environ.get("ALICE_SSL_CERT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "cert.pem")
@@ -4276,60 +4476,340 @@ def get_transport_security_mode() -> str:
 def get_trusted_client_ip(handler, client_address) -> str:
     """
     Extrait l'adresse IP cliente réelle en ne faisant confiance aux en-têtes
-    X-Forwarded-For QUE si la connexion immédiate provient de TRUSTED_PROXIES (C-01).
+    (X-Forwarded-For, X-Real-IP, Forwarded, CF-Connecting-IP) QUE si la connexion
+    immédiate provient de TRUSTED_PROXIES (C-01 / P1).
     """
-    immediate_ip = client_address[0] if client_address else "unknown"
-    if immediate_ip in TRUSTED_PROXIES and hasattr(handler, "headers"):
-        forwarded = handler.headers.get("X-Forwarded-For")
-        if forwarded:
-            first_ip = forwarded.split(",")[0].strip()
+    if isinstance(client_address, str):
+        immediate_ip = client_address
+    elif client_address and len(client_address) > 0:
+        immediate_ip = client_address[0]
+    else:
+        immediate_ip = "unknown"
+
+    net_cfg = get_network_config()
+    trusted = net_cfg.trusted_proxies if hasattr(net_cfg, "trusted_proxies") and net_cfg.trusted_proxies else TRUSTED_PROXIES
+
+    is_trusted = False
+    if immediate_ip in trusted:
+        is_trusted = True
+    else:
+        try:
+            imm_obj = ipaddress.ip_address(immediate_ip)
+            for t in trusted:
+                if "/" in t:
+                    try:
+                        if imm_obj in ipaddress.ip_network(t, strict=False):
+                            is_trusted = True
+                            break
+                    except ValueError:
+                        pass
+        except ValueError:
+            pass
+
+    if not is_trusted:
+        return immediate_ip
+
+    headers = getattr(handler, "headers", None)
+    if headers is None and isinstance(handler, dict):
+        headers = handler
+
+    if not headers:
+        return immediate_ip
+
+    def _strip_port(ip_str: str) -> str:
+        s = ip_str.strip()
+        if s.startswith("[") and "]:" in s:
+            return s.split("]:")[0].lstrip("[")
+        elif ":" in s and not s.startswith("[") and s.count(":") == 1:
+            return s.split(":")[0]
+        return s.strip("[]")
+
+    # 1. Vérification X-Forwarded-For (RFC standard : client leftmost dans la chaîne transmise au backend)
+    forwarded = headers.get("X-Forwarded-For")
+    if forwarded:
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if parts:
+            first_ip = _strip_port(parts[0])
             try:
                 ipaddress.ip_address(first_ip)
                 return first_ip
             except ValueError:
                 pass
+
+    # 2. Vérification X-Real-IP
+    x_real = headers.get("X-Real-IP")
+    if x_real:
+        clean_real = _strip_port(x_real)
+        try:
+            ipaddress.ip_address(clean_real)
+            return clean_real
+        except ValueError:
+            pass
+
+    # 3. Vérification CF-Connecting-IP (Cloudflare)
+    cf_ip = headers.get("CF-Connecting-IP")
+    if cf_ip:
+        clean_cf = _strip_port(cf_ip)
+        try:
+            ipaddress.ip_address(clean_cf)
+            return clean_cf
+        except ValueError:
+            pass
+
+    # 4. Vérification Forwarded (RFC 7239: for=...)
+    fwd_hdr = headers.get("Forwarded")
+    if fwd_hdr:
+        for item in fwd_hdr.split(";"):
+            item_clean = item.strip()
+            if item_clean.lower().startswith("for="):
+                for_val = _strip_port(item_clean[4:].strip().strip('"'))
+                try:
+                    ipaddress.ip_address(for_val)
+                    return for_val
+                except ValueError:
+                    pass
+
     return immediate_ip
 
-    async def start_ws():
-        liberer_port(8765)
-        sec_mode = get_transport_security_mode()
+async def start_ws():
+    """Démarre le serveur WebSocket avec les paramètres de liaison centralisés (P1)."""
+    net_cfg = get_network_config()
+    liberer_port(net_cfg.ws_port)
+    sec_mode = get_transport_security_mode()
 
-        # Comportement Fail-Closed en production si TLS requis et manquant (C-01 / Section 3.4)
-        if sec_mode == "FAIL_CLOSED_TLS_REQUIRED":
-            print("[SECURITY FATAL] Mode production exige TLS/WSS mais aucun certificat valide n'est configuré. Démarrage WebSocket interrompu par sécurité (C-01).")
-            return
+    # Comportement Fail-Closed en production si TLS requis et manquant (C-01)
+    if sec_mode == "FAIL_CLOSED_TLS_REQUIRED":
+        print("[SECURITY FATAL] Mode production exige TLS/WSS mais aucun certificat valide n'est configuré. Démarrage WebSocket interrompu par sécurité (C-01).")
+        return
 
-        ssl_ctx = get_ssl_context()
-        proto = "wss" if ssl_ctx else "ws"
-        print(f"[WEB] Serveur WebSocket ({proto}://) démarré sur port 8765 (Mode: {sec_mode})")
-        try:
-            async with websockets.serve(ws_handler, "0.0.0.0", 8765, ssl=ssl_ctx, max_size=15 * 1024 * 1024):
-                await asyncio.Future()
-        except Exception as e:
-            print(f"[WEB] Erreur critique démarrage serveur WebSocket : {e}")
-
-    threading.Thread(target=lambda: asyncio.run(start_ws()), daemon=True).start()
-
-    loop.run_until_complete(parler("Bonjour, Aboubakar Ibrahim Siddick"))
-    loop.close()
-    ecouter()
+    ssl_ctx = get_ssl_context()
+    proto = "wss" if ssl_ctx else "ws"
+    print(f"[WEB] Serveur WebSocket ({proto}://) démarré sur {net_cfg.ws_bind_address}:{net_cfg.ws_port} (Mode: {sec_mode})")
+    try:
+        async with websockets.serve(ws_handler, net_cfg.ws_bind_address, net_cfg.ws_port, ssl=ssl_ctx, max_size=15 * 1024 * 1024):
+            await asyncio.Future()
+    except Exception as e:
+        print(f"[WEB] Erreur critique démarrage serveur WebSocket : {e}")
 
 # ==========================================
 # LANCEMENT — MODE CONSOLE + FRONTEND WEB
 # ==========================================
 # Ursina desactive : l'interface est maintenant le frontend Three.js
 # dans le dossier frontend/ (npm run dev -> http://localhost:5173)
-# Le WebSocket est deja demarre par start_ia() sur ws://localhost:8765
+# Le WebSocket est demarre par start_ia() sur ws://localhost:8765
 
 pygame.init()
 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
 
+import http.server
+import http.cookies
+
+MOBILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mobile")
+
+class MobileHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=MOBILE_DIR, **kwargs)
+
+    def _set_security_headers(self):
+        """Injecte les en-têtes de sécurité HTTP durcis (P1 / Hardening 006)."""
+        csp = (
+            "default-src 'self'; "
+            "script-src 'self' https://cdnjs.cloudflare.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "media-src 'self' data: blob:; "
+            "connect-src 'self' ws: wss:; "
+            "font-src 'self' data:; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none';"
+        )
+        self.send_header("Content-Security-Policy", csp)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Permissions-Policy", "microphone=(self), camera=(), geolocation=(), payment=()")
+
+        if hasattr(self.server, "socket") and isinstance(self.server.socket, ssl.SSLSocket):
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+    def _set_cors_headers(self):
+        origin = self.headers.get("Origin")
+        if origin and WS_SESSION_MANAGER.is_origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token, X-Legacy-Client")
+
+    def end_headers(self):
+        self._set_security_headers()
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._set_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        # Ancien endpoint /api/auth/token supprimé et désactivé (SEC-04)
+        if self.path == "/api/auth/token":
+            self.send_response(410)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Endpoint obsolète et supprimé pour des raisons de sécurité. Utilisez /api/pair."}).encode("utf-8"))
+            return
+
+        if self.path == "/api/pair/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(PAIRING_MANAGER.get_status()).encode("utf-8"))
+            return
+
+        super().do_GET()
+
+    def do_POST(self):
+        client_ip = get_trusted_client_ip(self, self.client_address)
+
+        # 1. Endpoint d'appairage avec validation de PIN à usage unique (SEC-04 & P1)
+        if self.path == "/api/pair":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                data = json.loads(body) if body else {}
+                code = str(data.get("code", "")).strip()
+
+                if PAIRING_MANAGER.consume_pairing_code(code):
+                    new_session_id = secrets.token_hex(16)
+                    new_token = secrets.token_urlsafe(32)
+                    new_csrf = secrets.token_hex(16)
+                    WS_SESSION_MANAGER.register_session(
+                        session_id=new_session_id,
+                        token=new_token,
+                        csrf_token=new_csrf,
+                        client_type="mobile",
+                        client_ip=client_ip
+                    )
+                    is_secure = (get_transport_security_mode() in ("TLS_ENFORCED_PRODUCTION", "TLS_ACTIVE_DEVELOPMENT"))
+                    secure_flag = "; Secure" if is_secure else ""
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self._set_cors_headers()
+
+                    # Cookie de session HttpOnly (P1: élimine le stockage du secret dans localStorage)
+                    session_cookie = f"alice_session={new_session_id}:{new_token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400{secure_flag}"
+                    self.send_header("Set-Cookie", session_cookie)
+
+                    # Cookie CSRF (accessible JS pour inclusion dans en-tête X-CSRF-Token)
+                    csrf_cookie = f"alice_csrf={new_csrf}; Path=/; SameSite=Strict; Max-Age=86400{secure_flag}"
+                    self.send_header("Set-Cookie", csrf_cookie)
+
+                    self.end_headers()
+
+                    legacy_mode = (self.headers.get("X-Legacy-Client") == "1" or data.get("legacy") is True)
+                    resp = {
+                        "success": True,
+                        "session_id": new_session_id,
+                        "csrf_token": new_csrf
+                    }
+                    if legacy_mode:
+                        resp["token"] = new_token
+
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
+                    print(f"[PAIRING] Appairage réussi pour client mobile {client_ip} (Session {new_session_id}, Cookie HttpOnly émis)")
+                else:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self._set_cors_headers()
+                    self.end_headers()
+                    resp = {"success": False, "error": "Code d'appairage invalide ou expiré"}
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
+                    print(f"[PAIRING] Tentative d'appairage rejetée pour client {client_ip}")
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": f"Requête invalide : {e}"}).encode("utf-8"))
+            return
+
+        # 2. Endpoint de révocation de session (P1 / CSRF protected)
+        if self.path == "/api/revoke_session":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                data = json.loads(body) if body else {}
+
+                s_id = data.get("session_id", "")
+                tok = data.get("token", "")
+
+                cookie_hdr = self.headers.get("Cookie")
+                if cookie_hdr:
+                    import http.cookies
+                    try:
+                        cookies = http.cookies.SimpleCookie(cookie_hdr)
+                        if "alice_session" in cookies:
+                            c_val = cookies["alice_session"].value
+                            if ":" in c_val:
+                                c_sid, c_tok = c_val.split(":", 1)
+                                if not s_id:
+                                    s_id = c_sid
+                                if not tok:
+                                    tok = c_tok
+                    except Exception:
+                        pass
+
+                # Protection CSRF : exiger soit X-CSRF-Token valide, soit Origin vérifiée
+                csrf_hdr = self.headers.get("X-CSRF-Token")
+                origin_hdr = self.headers.get("Origin")
+                csrf_ok = False
+                if s_id and csrf_hdr and WS_SESSION_MANAGER.verify_csrf(s_id, csrf_hdr):
+                    csrf_ok = True
+                elif origin_hdr and WS_SESSION_MANAGER.is_origin_allowed(origin_hdr):
+                    csrf_ok = True
+                elif not origin_hdr and client_ip in ("127.0.0.1", "::1"):
+                    csrf_ok = True
+
+                if not csrf_ok and not (data.get("token") and not cookie_hdr):
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Échec validation CSRF"}).encode("utf-8"))
+                    return
+
+                if s_id and WS_SESSION_MANAGER.revoke_session(s_id, tok if tok else None):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self._set_cors_headers()
+                    # Expiration immédiate des cookies
+                    self.send_header("Set-Cookie", "alice_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+                    self.send_header("Set-Cookie", "alice_csrf=; Path=/; SameSite=Strict; Max-Age=0")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "message": "Session révoquée avec succès"}).encode("utf-8"))
+                else:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self._set_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": "Session introuvable ou jeton invalide"}).encode("utf-8"))
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+            return
+
+        super().do_POST()
+
+    def log_message(self, format, *args):
+        pass
+
+
 def start_mobile_http_server():
-    """Serveur HTTP/HTTPS pour servir l'interface mobile sur le port 8080 avec appairage sécurisé (C-01 / SEC-04)."""
+    """Serveur HTTP/HTTPS pour servir l'interface mobile avec appairage sécurisé, cookies HttpOnly et headers durcis (C-01 / P1)."""
     import http.server
-    mobile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mobile")
-    if not os.path.exists(mobile_dir):
-        print("[MOBILE] Dossier mobile/ introuvable, serveur non demarre.")
+    if not os.path.exists(MOBILE_DIR):
+        print("[MOBILE] Dossier mobile/ introuvable, serveur non démarré.")
         return
 
     sec_mode = get_transport_security_mode()
@@ -4338,126 +4818,20 @@ def start_mobile_http_server():
         print("[SECURITY FATAL] Mode production exige HTTPS mais aucun certificat TLS valide n'a été fourni. Serveur mobile HTTP désactivé par sécurité (C-01).")
         return
 
-    # Génération du code d'appairage initial à usage unique (SEC-04)
+    net_cfg = get_network_config()
     PAIRING_MANAGER.generate_pairing_code()
 
-    class MobileHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=mobile_dir, **kwargs)
+    is_ipv6 = ":" in net_cfg.bind_address
+    class DualStackHTTPServer(http.server.HTTPServer):
+        address_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
 
-        def _set_cors_headers(self):
-            # Interdiction stricte du wildcard '*' (SEC-04)
-            origin = self.headers.get("Origin")
-            if origin and WS_SESSION_MANAGER.is_origin_allowed(origin):
-                self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Access-Control-Allow-Credentials", "true")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-        def do_OPTIONS(self):
-            self.send_response(204)
-            self._set_cors_headers()
-            self.end_headers()
-
-        def do_GET(self):
-            # Ancien endpoint /api/auth/token supprimé et désactivé (SEC-04)
-            if self.path == "/api/auth/token":
-                self.send_response(410)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Endpoint obsolète et supprimé pour des raisons de sécurité. Utilisez /api/pair."}).encode("utf-8"))
-                return
-
-            if self.path == "/api/pair/status":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self._set_cors_headers()
-                self.end_headers()
-                self.wfile.write(json.dumps(PAIRING_MANAGER.get_status()).encode("utf-8"))
-                return
-
-            super().do_GET()
-
-        def do_POST(self):
-            client_ip = get_trusted_client_ip(self, self.client_address)
-
-            # 1. Endpoint d'appairage avec validation de PIN à usage unique (SEC-04)
-            if self.path == "/api/pair":
-                try:
-                    content_length = int(self.headers.get("Content-Length", 0))
-                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
-                    data = json.loads(body) if body else {}
-                    code = str(data.get("code", "")).strip()
-
-                    if PAIRING_MANAGER.consume_pairing_code(code):
-                        new_session_id = secrets.token_hex(16)
-                        new_token = secrets.token_urlsafe(32)
-                        WS_SESSION_MANAGER.register_session(
-                            session_id=new_session_id,
-                            token=new_token,
-                            client_type="mobile",
-                            client_ip=client_ip
-                        )
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self._set_cors_headers()
-                        self.end_headers()
-                        resp = {"success": True, "session_id": new_session_id, "token": new_token}
-                        self.wfile.write(json.dumps(resp).encode("utf-8"))
-                        print(f"[PAIRING] Appairage réussi pour client mobile {client_ip} (Session {new_session_id})")
-                    else:
-                        self.send_response(401)
-                        self.send_header("Content-Type", "application/json")
-                        self._set_cors_headers()
-                        self.end_headers()
-                        resp = {"success": False, "error": "Code d'appairage invalide ou expiré"}
-                        self.wfile.write(json.dumps(resp).encode("utf-8"))
-                        print(f"[PAIRING] Tentative d'appairage rejetée pour client {client_ip}")
-                except Exception as e:
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"success": False, "error": f"Requête invalide : {e}"}).encode("utf-8"))
-                return
-
-            # 2. Endpoint de révocation de session
-            if self.path == "/api/revoke_session":
-                try:
-                    content_length = int(self.headers.get("Content-Length", 0))
-                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
-                    data = json.loads(body) if body else {}
-                    s_id = data.get("session_id", "")
-                    tok = data.get("token", "")
-
-                    if WS_SESSION_MANAGER.revoke_session(s_id, tok):
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self._set_cors_headers()
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"success": True, "message": "Session révoquée avec succès"}).encode("utf-8"))
-                    else:
-                        self.send_response(401)
-                        self.send_header("Content-Type", "application/json")
-                        self._set_cors_headers()
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"success": False, "error": "Session introuvable ou jeton invalide"}).encode("utf-8"))
-                except Exception as e:
-                    self.send_response(400)
-                    self.end_headers()
-                return
-
-            super().do_POST()
-
-        def log_message(self, format, *args):
-            pass  # Silencieux
-
-    server = http.server.HTTPServer(("0.0.0.0", 8080), MobileHandler)
+    server = DualStackHTTPServer((net_cfg.bind_address, net_cfg.http_port), MobileHandler)
     ssl_ctx = get_ssl_context()
     if ssl_ctx:
         server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
-        print(f"[MOBILE] Serveur HTTPS sécurisé démarré sur https://0.0.0.0:8080 (Mode: {sec_mode})")
+        print(f"[MOBILE] Serveur HTTPS sécurisé démarré sur https://{net_cfg.bind_address}:{net_cfg.http_port} (Mode: {sec_mode})")
     else:
-        print(f"[SECURITY WARNING] Serveur HTTP démarré en clair sur http://0.0.0.0:8080 (Mode: {sec_mode}). NE PAS EXPOSER SUR UN RÉSEAU NON DE CONFIANCE.")
+        print(f"[SECURITY WARNING] Serveur HTTP démarré en clair sur http://{net_cfg.bind_address}:{net_cfg.http_port} (Mode: {sec_mode}). NE PAS EXPOSER SUR UN RÉSEAU NON DE CONFIANCE.")
     server.serve_forever()
 async def demander_ia_stream(texte):
     """Générateur de texte en streaming (Gemini)."""

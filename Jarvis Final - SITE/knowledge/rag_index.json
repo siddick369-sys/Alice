@@ -1,0 +1,30 @@
+{
+  "version": "1.0",
+  "updated_at": 1777132820.0417905,
+  "file_hashes": {
+    "C:\\Users\\USER\\Desktop\\Jarvis Final - SITE-V2\\Jarvis Final - SITE\\knowledge\\Classeur1.xlsx": "db1ab9634ebd7bce020191d37c280cc9ed3c28f79940023113c500b27f0ae8df"
+  },
+  "chunks": [
+    {
+      "source_file": "Classeur1.xlsx",
+      "source_type": "spreadsheet",
+      "provenance": "Feuille: sheet1 | Lignes: 1-10",
+      "text": "N° | MATRICULE | NOMS ET PRENOMS | ADRESSE_EMAIL | Téléphone | MENTION | PARCOURS | Niveau | Année académique\n1 | 24MEB01IU | ABALI GORKE YVAN DEFI CLEBERT CASIMIR | yvanabali97@gmail.com | 658802727 | MEB | MEB | 2 | 2025-2026\n2 | 24MEB02IU | AFNATANG SADOU | sadouafnatang@gmail.com | 697831157 | MEB | MEB | 2 | 2025-2026\n3 | 24MEB03IU | ALIMA MANA | alimamana200@gmail.com | 698647833 | MEB | MEB | 2 | 2025-2026\n4 | 24MEB04IU | AMINA DJOULDE PONDO'O FARIDA | aminafarida237@gmail.com | 691311883 | MEB | MEB | 2 | 2025-2026\n5 | 24MEB05IU | ARI MOUSTAPHA | arimoustapha732@gmail.com | 658816464 | MEB | MEB | 2 | 2025-2026\n6 | 24MEB07IU | ASTADJOUMBA KAATOOM saliou maimouna | mounaasta313@gmail.com | 697193112 | MEB | MEB | 2 | 2025-2026\n7 | 24MEB09IU | BAQUET HAMAD II ROCK DEZISE | dezisehamad@gmail.com | 690406391 | MEB | MEB | 2 | 2025-2026\n8 | 24MEB10IU | EYENGA AYINGONO SAMUEL | henryeyenga584@gmail.com | 693311923 | MEB | MEB | 2 | 2025-2026\n9 | 24MEB11IU | GUITIA NOEL | noelpato732@gmail.com | 692605788 | MEB | MEB | 2 | 2025-2026",
+      "chunk_id": "Classeur1.xlsx_0"
+    },
+    {
+      "source_file": "Classeur1.xlsx",
+      "source_type": "spreadsheet",
+      "provenance": "Feuille: sheet1 | Lignes: 11-20",
+      "text": "11 | 24MEB14IU | Kana Djoumessi Julien Brayan | brayandjoumessi02@gmail.com | 675434558 | MEB | MEB | 2 | 2025-2026\n12 | 24MEB15IU | KOKAM TEGHOUO NICOLAS DUPLEX | Kokamnicolas85@gmail.com | 696823554 | MEB | MEB | 2 | 2025-2026\n13 | 24MEB18IU | MANIBEN KERRI LA PRINCESSE | manibenkerry@gmail.com | 656151641 | MEB | MEB | 2 | 2025-2026\n14 | 24MEB20IU | MAVANA SATOU DOUMBA ADELE | doumbaadele@gmail.com | 659281016 | MEB | MEB | 2 | 2025-2026\n15 | 24MEB22IU | MPOMANG LINE CLAUDIA | linempomang@gmail.com | 651628437 | MEB | MEB | 2 | 2025-2026\n16 | 24MEB23IU | NDIKWA SINA SERGE | ndikwasinaserge@gmail.com | 656519307 | MEB | MEB | 2 | 2025-2026\n17 | 24MEB24IU | NKOUMA BIKELE ANGE VEDEL | angebikele1@gmail.com | 691666242 | MEB | MEB | 2 | 2025-2026\n18 | 24MEB32IU | NZEPANG THIERY ROLAND | nzepangthieryroland77@gmail.com | 655162853 | MEB | MEB | 2 | 2025-2026\n20 | 24MEB34IU | PALDOU NDRADA PARFAIT | paldouparfait43@gmail.com | 688196477 | MEB | MEB | 2 | 2025-2026\n21 | 24MEB26IU | PANANDIA MOUICHE SIDONIE PRECIOUS | precyprecious846@gmail.com | 690878432 | MEB | MEB | 2 | 2025-2026",
+      "chunk_id": "Classeur1.xlsx_1"
+    },
+    {
+      "source_file": "Classeur1.xlsx",
+      "source_type": "spreadsheet",
+      "provenance": "Feuille: sheet1 | Lignes: 21-24",
+      "text": "22 | 24MEB27IU | PAYANFOU Peuré marinello | Payangmarinello@gmail.com | 697494499 | MEB | MEB | 2 | 2025-2026\n24 | 24MEB29IU | SIDJUI FOKAM DIANE CELINE | fokamdianeceline@gmail.com | 690770125 | MEB | MEB | 2 | 2025-2026\n25 | 24MEB25IU | OUSMANOU AHMADOU | Ousmaneahmadou416@gmail.com | 693704061 | MEB | MEB | 2 | 2025-2026\n37 | 24MEB37IU | HAROUNA SAWALDA JEAN | jeanjackxy@gmail.com | 690307763 | MEB | MEB | 2 | 2025-2026",
+      "chunk_id": "Classeur1.xlsx_2"
+    }
+  ]
+}

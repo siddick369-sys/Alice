@@ -32,6 +32,21 @@ const pairingInputEl   = document.getElementById("pairing-code-input");
 const pairingSubmitBtn = document.getElementById("pairing-submit-btn");
 const pairingErrorEl   = document.getElementById("pairing-error");
 
+// ── DOM Refs Cycle de Vie & Confirmation (LOT A / E) ────────────────────────
+const commandStatusCardEl = document.getElementById("command-status-card");
+const commandStatePillEl  = document.getElementById("command-state-pill");
+const commandActionNameEl = document.getElementById("command-action-name");
+const commandStatusDetailEl = document.getElementById("command-status-detail");
+const actionConfirmModalEl= document.getElementById("action-confirm-modal");
+const confirmModalPromptEl= document.getElementById("confirm-modal-prompt");
+const confirmActionBtn    = document.getElementById("confirm-action-btn");
+const cancelActionBtn     = document.getElementById("cancel-action-btn");
+
+let pendingConfirmationCmdId = null;
+let pendingConfirmationToken = null;
+let statusCardTimer          = null;
+let lastCommandTime          = 0;
+
 // ── ORB 3D ──────────────────────────────────────────────────────────────────
 let orb = null;
 if (typeof createOrb === "function") {
@@ -170,9 +185,14 @@ async function submitPairingCode() {
       body: JSON.stringify({ code })
     });
     const result = await resp.json();
-    if (resp.ok && result.success && result.session_id && result.token) {
-      localStorage.setItem("jarvis_session_id", result.session_id);
-      localStorage.setItem("jarvis_session_token", result.token);
+    if (resp.ok && result.success && result.session_id) {
+      // Nettoyage impératif de tout token sensible dans localStorage (P1 / Hardening 006)
+      localStorage.removeItem("jarvis_session_token");
+      localStorage.removeItem("jarvis_session_id");
+      sessionStorage.setItem("jarvis_session_id", result.session_id);
+      if (result.csrf_token) {
+        sessionStorage.setItem("jarvis_csrf_token", result.csrf_token);
+      }
       hidePairingModal();
       connectWS();
     } else {
@@ -200,29 +220,28 @@ if (pairingInputEl) {
   });
 }
 
-// ── WebSocket ───────────────────────────────────────────────────────────────
+// ── WebSocket (Hardening P1 / Cookies HttpOnly) ───────────────────────────────
 function connectWS() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-  const sessionId = localStorage.getItem("jarvis_session_id");
-  const token = localStorage.getItem("jarvis_session_token");
-
-  // Si pas de session enregistrée, afficher le modal d'appairage (SEC-04-C)
-  if (!sessionId || !token) {
-    setConnected(false);
-    showPairingModal();
-    return;
-  }
+  // En P1 (Hardening 006), l'authentification prioritaire s'effectue automatiquement
+  // par cookie sécurisé HttpOnly transmis par le navigateur lors du handshake WebSocket.
+  // Les clés localStorage legacy sont uniquement utilisées en repli de transition.
+  const legacySessionId = localStorage.getItem("jarvis_session_id");
+  const legacyToken = localStorage.getItem("jarvis_session_token");
 
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
-    console.log("[WS] Connecté à", WS_URL, "- Transmission du handshake d'authentification");
-    ws.send(JSON.stringify({
-      type: "auth",
-      session_id: sessionId,
-      token: token
-    }));
+    console.log("[WS] Connecté à", WS_URL, "- En attente de validation handshake");
+    // Si un ancien jeton legacy est présent et pas de cookie, on le transmet pour compatibilité
+    if (legacySessionId && legacyToken) {
+      ws.send(JSON.stringify({
+        type: "auth",
+        session_id: legacySessionId,
+        token: legacyToken
+      }));
+    }
   });
 
   ws.addEventListener("message", (event) => {
@@ -230,9 +249,14 @@ function connectWS() {
       const data = JSON.parse(event.data);
 
       if (data.type === "auth_ok") {
-        console.log("[WS] Authentification réussie (Session:", data.session_id, ")");
+        console.log("[WS] Authentification réussie (Session:", data.session_id, "Méthode:", data.auth_method || "token", ")");
         setConnected(true);
         hidePairingModal();
+        return;
+      }
+
+      if (data.type === "command_lifecycle") {
+        handleCommandLifecycle(data);
         return;
       }
 
@@ -240,8 +264,10 @@ function connectWS() {
         console.warn("[WS] Erreur authentification :", data.message);
         localStorage.removeItem("jarvis_session_id");
         localStorage.removeItem("jarvis_session_token");
+        sessionStorage.removeItem("jarvis_session_id");
+        sessionStorage.removeItem("jarvis_csrf_token");
         setConnected(false);
-        showPairingModal("Session invalide ou expirée. Veuillez saisir un nouveau code.");
+        showPairingModal("Session invalide ou expirée. Veuillez saisir un nouveau code d'appairage.");
         try { ws.close(4001, "Auth error"); } catch(e) {}
         return;
       }
@@ -284,6 +310,8 @@ function connectWS() {
       // Rejet sécurité / session expirée : ne PAS relancer de boucle de reconnexion infinie !
       localStorage.removeItem("jarvis_session_id");
       localStorage.removeItem("jarvis_session_token");
+      sessionStorage.removeItem("jarvis_session_id");
+      sessionStorage.removeItem("jarvis_csrf_token");
       showPairingModal("Connexion refusée par le serveur. Veuillez réappairer l'appareil.");
       return;
     }
@@ -309,8 +337,111 @@ function sendCommand(text) {
     console.warn("[WS] WebSocket non connecté, commande ignorée.");
     return false;
   }
-  ws.send(JSON.stringify({ type: "mobile_command", text }));
+  const now = Date.now();
+  if (now - lastCommandTime < 800) {
+    console.warn("[WS] Anti-rebond : commande soumise trop rapidement.");
+    return false;
+  }
+  lastCommandTime = now;
+  const cmdId = "cmd_" + now + "_" + Math.random().toString(36).substr(2, 6);
+  ws.send(JSON.stringify({ type: "mobile_command", text, command_id: cmdId }));
   return true;
+}
+
+// ── Cycle de Vie des Commandes & Modale Confirmation (LOT A / E) ─────────────
+function handleCommandLifecycle(data) {
+  if (!commandStatusCardEl) return;
+  if (statusCardTimer) { clearTimeout(statusCardTimer); statusCardTimer = null; }
+
+  commandStatusCardEl.style.display = "block";
+  const state = (data.state || "UNKNOWN").toUpperCase();
+
+  if (commandStatePillEl) {
+    commandStatePillEl.textContent = state;
+    commandStatePillEl.className = "state-pill pill-" + state.toLowerCase();
+  }
+
+  if (commandActionNameEl) {
+    commandActionNameEl.textContent = data.action ? `[${data.action}]` : "";
+  }
+
+  if (commandStatusDetailEl) {
+    if (state === "REQUIRES_CONFIRMATION") {
+      commandStatusDetailEl.textContent = "Action sensible en attente d'accord.";
+      showActionConfirmModal(data.command_id, data.confirmation_token, data.confirmation_prompt);
+    } else if (state === "RUNNING") {
+      commandStatusDetailEl.textContent = "Exécution de l'action en cours...";
+    } else if (state === "SUCCEEDED") {
+      const resMsg = typeof data.result === "string" ? data.result : "Action réussie et confirmée.";
+      commandStatusDetailEl.textContent = resMsg;
+      scheduleStatusCardHide(4500);
+    } else if (state === "FAILED") {
+      commandStatusDetailEl.textContent = data.error || "Échec de l'action demandée.";
+      scheduleStatusCardHide(5000);
+    } else if (state === "CANCELLED") {
+      commandStatusDetailEl.textContent = "Commande annulée par l'utilisateur.";
+      scheduleStatusCardHide(3500);
+    } else if (state === "UNKNOWN") {
+      commandStatusDetailEl.textContent = data.error || "État physique du matériel non confirmé.";
+      scheduleStatusCardHide(5000);
+    } else {
+      commandStatusDetailEl.textContent = "Traitement en cours...";
+    }
+  }
+}
+
+function showActionConfirmModal(cmdId, token, prompt) {
+  pendingConfirmationCmdId = cmdId;
+  pendingConfirmationToken = token;
+  if (confirmModalPromptEl) {
+    confirmModalPromptEl.textContent = prompt || "Une action sensible requiert votre confirmation.";
+  }
+  if (actionConfirmModalEl) {
+    actionConfirmModalEl.style.display = "flex";
+  }
+}
+
+function hideActionConfirmModal() {
+  if (actionConfirmModalEl) {
+    actionConfirmModalEl.style.display = "none";
+  }
+  pendingConfirmationCmdId = null;
+  pendingConfirmationToken = null;
+}
+
+function scheduleStatusCardHide(delayMs) {
+  if (statusCardTimer) clearTimeout(statusCardTimer);
+  statusCardTimer = setTimeout(() => {
+    if (commandStatusCardEl) commandStatusCardEl.style.display = "none";
+    statusCardTimer = null;
+  }, delayMs);
+}
+
+if (confirmActionBtn) {
+  confirmActionBtn.addEventListener("click", () => {
+    if (ws && ws.readyState === WebSocket.OPEN && pendingConfirmationCmdId) {
+      ws.send(JSON.stringify({
+        type: "confirm_action",
+        command_id: pendingConfirmationCmdId,
+        confirmation_token: pendingConfirmationToken,
+        confirmed: true
+      }));
+    }
+    hideActionConfirmModal();
+  });
+}
+
+if (cancelActionBtn) {
+  cancelActionBtn.addEventListener("click", () => {
+    if (ws && ws.readyState === WebSocket.OPEN && pendingConfirmationCmdId) {
+      ws.send(JSON.stringify({
+        type: "confirm_action",
+        command_id: pendingConfirmationCmdId,
+        confirmed: false
+      }));
+    }
+    hideActionConfirmModal();
+  });
 }
 
 // ── Affichage dialogue ──────────────────────────────────────────────────────
