@@ -6,6 +6,7 @@
 import os
 import io
 import re
+import ast
 import json
 import time
 import base64
@@ -831,109 +832,148 @@ class AliceModules:
         return {"success": False, "plan": "", "message": "Échec de la planification."}
 
     # ========================================================
-    # 13. VÉRIFICATION DE CODE EN BOUCLE (Auto-debug)
+    # 13. VÉRIFICATION DE CODE STATIQUE ET SÉCURISÉE (SEC-01)
+    # Exécution dynamique sur hôte désactivée par mesure de sécurité
     # ========================================================
     async def verifier_code_boucle(self, code: str, langage: str = "python", max_iterations: int = 3) -> dict:
         """
-        Écrit un script, le teste, lit l'erreur, et le corrige
-        en boucle jusqu'à ce qu'il fonctionne.
+        Analyse statiquement le code (syntaxe AST, détection de patterns dangereux),
+        et demande à l'IA de le corriger en boucle sans JAMAIS l'exécuter sur le système hôte.
+        L'exécution arbitraire est strictement neutralisée (SEC-01).
         """
-        if not self.gemini_client:
-            return {"success": False, "code_final": code, "iterations": 0, "message": "Client Gemini non disponible."}
-
         code_actuel = code
         historique_erreurs = []
+        dangers_detectes = []
+
+        # Mots-clés / modules critiques à interdire en mode non-sandboxé
+        DANGEROUS_MODULES = {"os", "sys", "subprocess", "shutil", "socket", "pty", "commands", "winreg"}
+        DANGEROUS_BUILTINS = {"exec", "eval", "__import__", "compile", "breakpoint", "open", "input"}
 
         for iteration in range(max_iterations):
-            print(f"[AUTO-DEBUG] Itération {iteration+1}/{max_iterations}")
+            erreurs_iteration = []
+            dangers_iteration = []
+
+            # Analyse statique selon le langage
+            if langage == "python":
+                try:
+                    tree = ast.parse(code_actuel)
+                    # Inspection AST pour détecter les appels et imports dangereux
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                if alias.name.split('.')[0] in DANGEROUS_MODULES:
+                                    dangers_iteration.append(f"Import interdit détecté : {alias.name}")
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module and node.module.split('.')[0] in DANGEROUS_MODULES:
+                                dangers_iteration.append(f"Import interdit depuis module : {node.module}")
+                        elif isinstance(node, ast.Call):
+                            if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                                dangers_iteration.append(f"Appel interdit à builtin dangereux : {node.func.id}()")
+                            elif isinstance(node.func, ast.Attribute):
+                                if node.func.attr in ("system", "popen", "spawn", "exec", "eval"):
+                                    dangers_iteration.append(f"Appel de méthode système potentiellement dangereuse : .{node.func.attr}()")
+                except SyntaxError as syn_err:
+                    erreurs_iteration.append(f"SyntaxError: {syn_err.msg} (ligne {syn_err.lineno})")
+                except Exception as parse_err:
+                    erreurs_iteration.append(f"ParseError: {parse_err}")
+            elif langage == "javascript":
+                js_dangerous = ["eval(", "Function(", "child_process", "require('fs')", "require(\"fs\")", "process.exit"]
+                for pat in js_dangerous:
+                    if pat in code_actuel:
+                        dangers_iteration.append(f"Pattern JavaScript non sécurisé : {pat}")
+                if code_actuel.count("{") != code_actuel.count("}"):
+                    erreurs_iteration.append("Erreur de syntaxe : accolades asymétriques")
+                if code_actuel.count("(") != code_actuel.count(")"):
+                    erreurs_iteration.append("Erreur de syntaxe : parenthèses asymétriques")
+
+            if not erreurs_iteration and not dangers_iteration:
+                return {
+                    "success": True,
+                    "code_final": code_actuel,
+                    "iterations": iteration + 1,
+                    "message": (
+                        f"Code validé avec succès par analyse statique et vérification de sécurité "
+                        f"après {iteration + 1} itération(s). Aucune exécution arbitraire sur le système hôte (SEC-01)."
+                    ),
+                    "execution_status": "DISABLED_FOR_SECURITY",
+                    "safety_status": "SECURE_STATIC_VERIFIED",
+                    "details": []
+                }
+
+            rapport_problemes = []
+            if erreurs_iteration:
+                rapport_problemes.extend(erreurs_iteration)
+            if dangers_iteration:
+                rapport_problemes.extend([f"Alerte sécurité : {d}" for d in dangers_iteration])
+
+            derniers_problemes = " ; ".join(rapport_problemes)
+            historique_erreurs.append(derniers_problemes)
+            dangers_detectes.extend(dangers_iteration)
+
+            if not self.gemini_client:
+                return {
+                    "success": False,
+                    "code_final": code_actuel,
+                    "iterations": iteration + 1,
+                    "message": f"Échec de validation statique : {derniers_problemes}. Client Gemini indisponible pour auto-correction.",
+                    "execution_status": "DISABLED_FOR_SECURITY",
+                    "safety_status": "REJECTED_UNSAFE_OR_INVALID",
+                    "details": rapport_problemes
+                }
 
             if not self.gemini_limiter.can_call():
-                return {"success": False, "code_final": code_actuel, "iterations": iteration,
-                        "message": "Quota Gemini atteint pendant le debug."}
+                return {
+                    "success": False,
+                    "code_final": code_actuel,
+                    "iterations": iteration + 1,
+                    "message": f"Quota Gemini atteint pendant la correction statique. Problèmes : {derniers_problemes}",
+                    "execution_status": "DISABLED_FOR_SECURITY",
+                    "safety_status": "REJECTED_UNSAFE_OR_INVALID",
+                    "details": rapport_problemes
+                }
 
-            # Écrire le script dans un fichier temporaire
-            ext = ".py" if langage == "python" else ".js"
-            temp_file = os.path.join(tempfile.gettempdir(), f"alice_test_{int(time.time())}{ext}")
+            prompt = (
+                f"Tu es ALICE, analyste et correctrice experte en sécurité de code ({langage}).\n"
+                f"Le code suivant a échoué aux vérifications statiques et de sécurité :\n```{langage}\n{code_actuel}\n```\n"
+                f"Problèmes détectés :\n```\n{derniers_problemes}\n```\n"
+                f"Consignes absolues :\n"
+                f"1. Corrige la syntaxe et assure-toi que le code est propre et valide.\n"
+                f"2. Supprime TOUT appel dangereux, import système (os, sys, subprocess), ou mécanisme d'évaluation dynamique (eval, exec).\n"
+                f"3. Renvoie UNIQUEMENT le code corrigé sans aucune explication, encadré par des balises ```{langage}.\n"
+            )
 
-            try:
-                with open(temp_file, "w", encoding="utf-8") as f:
-                    f.write(code_actuel)
-
-                # Exécuter le script
-                if langage == "python":
-                    cmd = ["python", temp_file]
-                elif langage == "javascript":
-                    cmd = ["node", temp_file]
-                else:
-                    cmd = ["python", temp_file]
-
-                result = await asyncio.to_thread(
-                    subprocess.run,
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=15
-                )
-
-                if result.returncode == 0:
-                    # Succès !
-                    return {
-                        "success": True,
-                        "code_final": code_actuel,
-                        "output": result.stdout[:500],
-                        "iterations": iteration + 1,
-                        "message": f"Code corrigé après {iteration + 1} itération(s). Sortie : {result.stdout[:200]}"
-                    }
-                else:
-                    error_msg = result.stderr[:500]
-                    historique_erreurs.append(error_msg)
-                    print(f"[AUTO-DEBUG] Erreur : {error_msg[:100]}")
-
-                    # Demander à Gemini de corriger
-                    prompt = (
-                        f"Tu es ALICE, débogueuse experte en {langage}.\n"
-                        f"Voici le code qui a produit une erreur :\n```{langage}\n{code_actuel}\n```\n"
-                        f"Erreur obtenue :\n```\n{error_msg}\n```\n"
-                    )
-                    if len(historique_erreurs) > 1:
-                        prompt += f"Erreurs précédentes : {historique_erreurs[:-1]}\n"
-                    prompt += (
-                        "\nCorrige le code. Renvoie UNIQUEMENT le code corrigé sans explication, "
-                        "encadré par des balises ```.\n"
-                    )
-
-                    self.gemini_limiter.record_call()
-                    for model in self.gemini_models:
-                        try:
-                            response = await self.gemini_client.aio.models.generate_content(
-                                model=model,
-                                contents=[prompt]
-                            )
-                            # Extraire le code de la réponse
-                            match = re.search(r'```(?:\w+)?\n(.*?)```', response.text, re.DOTALL)
-                            if match:
-                                code_actuel = match.group(1).strip()
-                            else:
-                                code_actuel = response.text.strip()
-                            break
-                        except:
-                            continue
-
-            except subprocess.TimeoutExpired:
-                historique_erreurs.append("TIMEOUT : Le script a dépassé 15 secondes")
-            except Exception as e:
-                historique_erreurs.append(str(e))
-            finally:
+            self.gemini_limiter.record_call()
+            correction_reussie = False
+            for model in self.gemini_models:
                 try:
-                    os.remove(temp_file)
-                except:
-                    pass
+                    response = await self.gemini_client.aio.models.generate_content(
+                        model=model,
+                        contents=[prompt]
+                    )
+                    match = re.search(r'```(?:\w+)?\n(.*?)```', response.text, re.DOTALL)
+                    if match:
+                        code_actuel = match.group(1).strip()
+                    else:
+                        code_actuel = response.text.strip()
+                    correction_reussie = True
+                    break
+                except Exception:
+                    continue
+
+            if not correction_reussie:
+                break
 
         return {
             "success": False,
             "code_final": code_actuel,
             "iterations": max_iterations,
-            "message": f"Échec après {max_iterations} tentatives. Dernière erreur : {historique_erreurs[-1] if historique_erreurs else 'inconnue'}"
+            "message": (
+                f"Échec de la validation statique après {max_iterations} tentative(s). "
+                f"Derniers problèmes : {historique_erreurs[-1] if historique_erreurs else 'inconnus'}"
+            ),
+            "execution_status": "DISABLED_FOR_SECURITY",
+            "safety_status": "REJECTED_UNSAFE_OR_INVALID",
+            "details": historique_erreurs
         }
 
     # ========================================================

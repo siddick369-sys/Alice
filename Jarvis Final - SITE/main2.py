@@ -1,6 +1,13 @@
 # from ursina import *  # DESACTIVE — interface web Three.js
+import sys
+import ssl
 import threading
 import asyncio
+import secrets
+import hmac
+import ipaddress
+from urllib.parse import urlparse, parse_qs, urlsplit
+from typing import Optional, List, Dict, Any, Union, Tuple
 import google.genai as genai
 from google.genai import types
 import speech_recognition as sr
@@ -162,6 +169,152 @@ def ouvrir_url_pc(url):
     except Exception as e:
         return f"Impossible d'ouvrir l'URL : {e}"
 
+# ==========================================
+# MEMOIRE PERSISTANTE (C-03 / SEC-06 : Intégrité, Thread-Safety, Verrou Cross-Process & Écriture Atomique)
+# ==========================================
+MEMOIRE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_memoire.json")
+MEMOIRE_LOCK = threading.RLock()
+
+class CrossProcessMemoryLock:
+    """
+    Verrou mémoire hybride : thread-safe réentrant et cross-process au niveau OS.
+    Utilise msvcrt (Windows) ou fcntl (Unix) avec gestion de timeout, tolérance
+    aux pannes et prévention absolue des deadlocks et verrous orphelins (C-03).
+    """
+    def __init__(self, lock_file: Optional[str] = None, timeout: float = 5.0, thread_lock: Optional[threading.RLock] = None):
+        self.lock_file = lock_file or f"{MEMOIRE_FILE}.crossprocess.lock"
+        self.timeout = timeout
+        self.thread_lock = thread_lock or MEMOIRE_LOCK
+        self.file_fd = None
+        self._owner_thread = None
+        self._reentrant_count = 0
+
+    def __enter__(self):
+        current_thread = threading.get_ident()
+        self.thread_lock.acquire()
+
+        if self._owner_thread == current_thread:
+            self._reentrant_count += 1
+            return self
+
+        start_time = time.time()
+        while True:
+            try:
+                self.file_fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(self.file_fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.file_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                self._owner_thread = current_thread
+                self._reentrant_count = 1
+                return self
+            except (OSError, IOError):
+                if self.file_fd is not None:
+                    try:
+                        os.close(self.file_fd)
+                    except Exception:
+                        pass
+                    self.file_fd = None
+
+                if time.time() - start_time >= self.timeout:
+                    self.thread_lock.release()
+                    raise TimeoutError(f"Timeout ({self.timeout}s) acquisition verrou cross-process : {self.lock_file}")
+                time.sleep(0.02)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        current_thread = threading.get_ident()
+        if self._owner_thread == current_thread:
+            self._reentrant_count -= 1
+            if self._reentrant_count == 0:
+                try:
+                    if self.file_fd is not None:
+                        if sys.platform == "win32":
+                            import msvcrt
+                            try:
+                                msvcrt.locking(self.file_fd, msvcrt.LK_UNLCK, 1)
+                            except Exception:
+                                pass
+                        else:
+                            import fcntl
+                            try:
+                                fcntl.flock(self.file_fd, fcntl.LOCK_UN)
+                            except Exception:
+                                pass
+                        try:
+                            os.close(self.file_fd)
+                        except Exception:
+                            pass
+                        self.file_fd = None
+                finally:
+                    self._owner_thread = None
+
+        self.thread_lock.release()
+
+CROSS_PROCESS_MEMORY_LOCK = CrossProcessMemoryLock()
+
+def charger_memoire():
+    """Charge la mémoire de manière thread-safe et cross-process avec résilience face aux corruptions."""
+    with CROSS_PROCESS_MEMORY_LOCK:
+        if os.path.exists(MEMOIRE_FILE):
+            try:
+                with open(MEMOIRE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception as e:
+                print(f"[MEMOIRE] Erreur lecture fichier mémoire (corruption potentielle) : {e}")
+                return {}
+        return {}
+
+def sauvegarder_memoire(memoire):
+    """Sauvegarde atomique de la mémoire avec verrouillage cross-process et remplacement sécurisé."""
+    if not isinstance(memoire, dict):
+        print("[MEMOIRE] Format de mémoire invalide, sauvegarde ignorée.")
+        return False
+    with CROSS_PROCESS_MEMORY_LOCK:
+        temp_file = f"{MEMOIRE_FILE}.{os.getpid()}_{time.time_ns()}.tmp"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(memoire, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, MEMOIRE_FILE)
+            return True
+        except Exception as e:
+            print(f"[MEMOIRE] Erreur sauvegarde atomique mémoire : {e}")
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+            return False
+
+def ajouter_memoire(cle, valeur):
+    """Ajoute un fait en mémoire de manière thread-safe et cross-process."""
+    with CROSS_PROCESS_MEMORY_LOCK:
+        memoire = charger_memoire()
+        memoire[cle] = {"valeur": valeur, "timestamp": time.strftime("%d/%m/%Y %H:%M")}
+        return sauvegarder_memoire(memoire)
+
+def supprimer_memoire(cle):
+    """Supprime un fait en mémoire de manière thread-safe et cross-process (exacte ou floue)."""
+    with CROSS_PROCESS_MEMORY_LOCK:
+        memoire = charger_memoire()
+        if not memoire:
+            return False
+        if cle in memoire:
+            del memoire[cle]
+            return sauvegarder_memoire(memoire)
+        cle_lower = cle.lower()
+        keys_to_del = [k for k in memoire.keys() if cle_lower in k.lower()]
+        if keys_to_del:
+            for k in keys_to_del:
+                del memoire[k]
+            return sauvegarder_memoire(memoire)
+        return False
+
 def charger_contexte_rag():
     contexte = ""
     fichiers_trouves = False
@@ -175,18 +328,17 @@ def charger_contexte_rag():
                 if contenu:
                     contexte += f"--- DEBUT DOCUMENT: {chemin.name} ---\n{contenu}\n--- FIN DOCUMENT: {chemin.name} ---\n\n"
     
-    if os.path.exists("jarvis_memoire.json"):
-        try:
-            with open("jarvis_memoire.json", "r", encoding="utf-8") as f:
-                mem = json.load(f)
-            if mem:
-                contexte += "FAITS MEMORISES SUR L'UTILISATEUR :\n"
-                for k, v in mem.items():
-                    contexte += f"- {k}: {v.get('valeur', '')} (enregistré le {v.get('timestamp', 'inconnu')})\n"
-                contexte += "\n"
-        except: pass
+    mem = charger_memoire()
+    if mem:
+        contexte += "FAITS MEMORISES SUR L'UTILISATEUR :\n"
+        for k, v in mem.items():
+            if isinstance(v, dict):
+                contexte += f"- {k}: {v.get('valeur', '')} (enregistré le {v.get('timestamp', 'inconnu')})\n"
+            else:
+                contexte += f"- {k}: {v}\n"
+        contexte += "\n"
 
-    return contexte if (fichiers_trouves or os.path.exists("jarvis_memoire.json")) else ""
+    return contexte if (fichiers_trouves or bool(mem)) else ""
 
 HA_HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
@@ -383,121 +535,492 @@ def chercher_fichier(nom, chemin=None):
                 resultats.append(os.path.join(root, f))
     return resultats, None
 
-# ==========================================
-# MEMOIRE PERSISTANTE
-# ==========================================
-MEMOIRE_FILE = "jarvis_memoire.json"
-
-def charger_memoire():
-    if os.path.exists(MEMOIRE_FILE):
-        try:
-            with open(MEMOIRE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def sauvegarder_memoire(memoire):
-    try:
-        with open(MEMOIRE_FILE, "w", encoding="utf-8") as f:
-            json.dump(memoire, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Erreur sauvegarde memoire : {e}")
-
-def ajouter_memoire(cle, valeur):
-    memoire      = charger_memoire()
-    memoire[cle] = {"valeur": valeur, "timestamp": time.strftime("%d/%m/%Y %H:%M")}
-    sauvegarder_memoire(memoire)
-
-def supprimer_memoire(cle):
-    memoire = charger_memoire()
-    if cle in memoire:
-        del memoire[cle]
-        sauvegarder_memoire(memoire)
-        return True
-    return False
 
 def construire_contexte_memoire():
+    """Construit le contexte mémoire pour le prompt IA sans crash sur structures hétérogènes."""
     memoire = charger_memoire()
     lignes = ["MEMOIRE PERSISTANTE :"]
-    if memoire:
+    if memoire and isinstance(memoire, dict):
         for cle, data in memoire.items():
-            lignes.append(f"  - {cle} : {data['valeur']} (note le {data['timestamp']})")
+            if cle == "reminders" and isinstance(data, list):
+                if data:
+                    lignes.append("  - Rappels programmés :")
+                    for r in data:
+                        if isinstance(r, dict):
+                            t = r.get("task", "Tâche inconnue")
+                            tp = r.get("type", "rappel")
+                            d = r.get("date", "")
+                            lignes.append(f"    * [{tp}] {t} ({d})")
+            elif isinstance(data, dict) and "valeur" in data:
+                ts = data.get("timestamp", "date inconnue")
+                lignes.append(f"  - {cle} : {data['valeur']} (note le {ts})")
+            elif isinstance(data, (str, int, float, bool)):
+                lignes.append(f"  - {cle} : {data}")
     
     # Injection de la Vision OCR (Nouveau)
     if jarvis_vision:
-        lignes.append("\n" + jarvis_vision.get_context())
+        try:
+            lignes.append("\n" + jarvis_vision.get_context())
+        except Exception:
+            pass
         
     return "\n".join(lignes) if len(lignes) > 1 else ""
 
 # ==========================================
-# WEBSOCKET
+# GESTIONNAIRE D'APPAIRAGE MOBILE SECURISE (SEC-04)
 # ==========================================
+class PairingManager:
+    """Gestionnaire d'appairage mobile avec code PIN à usage unique, TTL court et protection anti-brute force."""
+    def __init__(self, code_ttl: float = 120.0, max_failed_attempts: int = 5):
+        self.code_ttl = code_ttl
+        self.max_failed_attempts = max_failed_attempts
+        self.active_pairing_code: Optional[str] = None
+        self.code_expires_at: float = 0.0
+        self.failed_attempts: int = 0
+        self.lock = threading.Lock()
+
+    def generate_pairing_code(self) -> str:
+        with self.lock:
+            code = "".join([str(secrets.randbelow(10)) for _ in range(6)])
+            self.active_pairing_code = code
+            self.code_expires_at = time.time() + self.code_ttl
+            self.failed_attempts = 0
+            print(f"[PAIRING] Nouveau code d'appairage mobile généré : {code} (valable {int(self.code_ttl)}s)")
+            return code
+
+    def consume_pairing_code(self, code_attempt: str) -> bool:
+        if not code_attempt or not isinstance(code_attempt, str):
+            return False
+        with self.lock:
+            if not self.active_pairing_code:
+                return False
+            if time.time() > self.code_expires_at:
+                self.active_pairing_code = None
+                return False
+            if self.failed_attempts >= self.max_failed_attempts:
+                self.active_pairing_code = None
+                return False
+            if hmac.compare_digest(self.active_pairing_code, code_attempt.strip()):
+                self.active_pairing_code = None  # Usage unique immédiat
+                return True
+            else:
+                self.failed_attempts += 1
+                if self.failed_attempts >= self.max_failed_attempts:
+                    self.active_pairing_code = None
+                    print("[PAIRING] Nombre maximal de tentatives d'appairage atteint. Code invalidé.")
+                return False
+
+    def get_status(self) -> dict:
+        with self.lock:
+            active = bool(self.active_pairing_code and time.time() <= self.code_expires_at and self.failed_attempts < self.max_failed_attempts)
+            remaining = max(0, int(self.code_expires_at - time.time())) if active else 0
+            return {"active": active, "remaining_seconds": remaining}
+
+PAIRING_MANAGER = PairingManager()
+
+# ==========================================
+# WEBSOCKET & SESSION HARDENING (SEC-04 & SEC-02)
+# ==========================================
+class WSSessionManager:
+    """Gestionnaire de sessions cryptographiques et sécurité WebSocket."""
+    def __init__(self, session_ttl: float = 86400.0, max_connections: int = 10):
+        self.session_ttl = session_ttl
+        self.max_connections = max_connections
+        self.lock = threading.Lock()
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.revoked_tokens = set()
+
+        # Session desktop locale par défaut (générée en mémoire au démarrage, sans écriture sur disque)
+        self.desktop_session_id = "desktop_local"
+        self.desktop_token = secrets.token_urlsafe(32)
+        self.register_session(
+            session_id=self.desktop_session_id,
+            token=self.desktop_token,
+            client_type="desktop",
+            client_ip="127.0.0.1",
+            ttl=86400.0 * 30
+        )
+
+    def register_session(self, session_id: str, token: str, client_type: str = "mobile", client_ip: str = "unknown", ttl: Optional[float] = None) -> bool:
+        with self.lock:
+            expires_at = time.time() + (ttl or self.session_ttl)
+            self.sessions[session_id] = {
+                "token": token,
+                "client_type": client_type,
+                "client_ip": client_ip,
+                "created_at": time.time(),
+                "expires_at": expires_at,
+                "last_seen": time.time()
+            }
+            return True
+
+    def verify_session(self, session_id: str, token: str) -> bool:
+        if not session_id or not token or not isinstance(session_id, str) or not isinstance(token, str):
+            return False
+        if token in self.revoked_tokens:
+            return False
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return False
+            if time.time() > session["expires_at"]:
+                del self.sessions[session_id]
+                return False
+            if hmac.compare_digest(session["token"], token):
+                session["last_seen"] = time.time()
+                return True
+            return False
+
+    def revoke_session(self, session_id: str, token: Optional[str] = None) -> bool:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if not session:
+                return False
+            if token and not hmac.compare_digest(session["token"], token):
+                return False
+            self.revoked_tokens.add(session["token"])
+            del self.sessions[session_id]
+            return True
+
+    def is_origin_allowed(self, origin: Optional[str]) -> bool:
+        """
+        Validation stricte, granulaire et normalisée des origines Web (C-02 / SEC-04-B).
+        Conforme aux spécifications RFC 6454 / RFC 6455.
+        Valide schéma, nom d'hôte, numéro de port, interdit userinfo/path/query/fragment,
+        rejette tout port invalide ou inattendu et s'appuie sur une allowlist configurable.
+        """
+        if not origin or not isinstance(origin, str) or origin == "null":
+            return False
+
+        # Rejet des origines avec espaces ou caractères d'échappement
+        if origin.strip() != origin or any(c in origin for c in ('\r', '\n', '\t', ' ')):
+            return False
+
+        try:
+            parsed = urlsplit(origin)
+        except Exception:
+            return False
+
+        # 1. Validation stricte du schéma (http ou https uniquement)
+        if parsed.scheme not in ("http", "https"):
+            return False
+
+        # 2. Rejet formel des composants userinfo (user:pass@host)
+        if parsed.username or parsed.password:
+            return False
+
+        # 3. Une origine Web RFC 6454 ne comporte ni chemin spécifique, ni query, ni fragment
+        if parsed.path not in ("", "/"):
+            return False
+        if parsed.query or parsed.fragment:
+            return False
+
+        # 4. Validation et extraction stricte du nom d'hôte
+        try:
+            host = parsed.hostname
+        except Exception:
+            return False
+
+        if not host:
+            return False
+
+        # Rejet des points finals (ex: localhost.) et suffixes malveillants
+        if host.endswith("."):
+            return False
+
+        # 5. Validation stricte du port (RFC 6454 : port entre 1 et 65535)
+        try:
+            raw_port = parsed.port
+        except ValueError:
+            # urlsplit lève ValueError si le port est non numérique ou hors de 0..65535 (ex: :99999 ou :-1)
+            return False
+
+        if raw_port is None:
+            port = 80 if parsed.scheme == "http" else 443
+        else:
+            port = raw_port
+
+        if not (1 <= port <= 65535):
+            return False
+
+        # 6. Allowlist d'origines (Environment-Aware)
+        is_production = (
+            os.environ.get("JARVIS_ENV", "").lower() == "production"
+            or os.environ.get("ALICE_ENV", "").lower() == "production"
+        )
+
+        # Ports autorisés pour le serveur local et dev-server
+        ALLOWED_PORTS = {8080, 8443, 8765}
+        if not is_production:
+            ALLOWED_PORTS.update({5173, 3000})
+
+        # Allowlist explicite configurable par variable d'environnement (ALICE_ALLOWED_ORIGINS / JARVIS_ALLOWED_ORIGINS)
+        custom_env = os.environ.get("ALICE_ALLOWED_ORIGINS") or os.environ.get("JARVIS_ALLOWED_ORIGINS")
+        if custom_env:
+            for item in custom_env.split(","):
+                item_clean = item.strip()
+                if item_clean:
+                    try:
+                        p_item = urlsplit(item_clean)
+                        p_item_host = p_item.hostname
+                        p_item_port = p_item.port if p_item.port is not None else (80 if p_item.scheme == "http" else 443)
+                        if p_item.scheme == parsed.scheme and p_item_host and p_item_host.lower() == host.lower() and p_item_port == port:
+                            return True
+                    except Exception:
+                        pass
+
+        # Vérification des hôtes loopback autorisés (localhost, 127.0.0.1, [::1])
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return port in ALLOWED_PORTS
+
+        # Vérification des adresses IP privées du réseau local (LAN)
+        try:
+            ip = ipaddress.ip_address(host)
+            # Rejet formel des adresses link-local (métadonnées cloud 169.254.x.x) et des IP publiques
+            if ip.is_link_local or not (ip.is_private or ip.is_loopback):
+                return False
+
+            # Sur les adresses IP privées, le port DOIT être un port autorisé
+            if port not in ALLOWED_PORTS:
+                return False
+
+            # En production, l'accès depuis le LAN nécessite une activation explicite (fail-closed)
+            if is_production and os.environ.get("ALICE_ALLOW_LAN_ORIGINS", "0") != "1":
+                return False
+
+            return True
+        except ValueError:
+            # Nom de domaine distant non IP (ex: 192.168.attacker.com, evil.com) -> REJET ABSOLU
+            return False
+
+WS_SESSION_MANAGER = WSSessionManager()
 CONNECTED_CLIENTS = set()
 interface_deja_connectee = False
 _skip_pc_audio = False  # True quand la commande vient du mobile (le tél gère son propre TTS)
 PENDING_SCREEN_CAPTURES = {}
 
+def get_active_ws_token() -> str:
+    return WS_SESSION_MANAGER.desktop_token
+
 async def ws_handler(websocket):
     global interface_deja_connectee
+    
+    # 1. Vérification de la limite de connexions simultanées (SEC-04)
+    if len(CONNECTED_CLIENTS) >= WS_SESSION_MANAGER.max_connections:
+        print(f"[WS SECURITY] Rejet connexion : limite maximale atteinte ({WS_SESSION_MANAGER.max_connections})")
+        await websocket.close(code=4008, reason="Max connections reached")
+        return
+
+    # 2. Vérification de l'origine (SEC-04)
+    origin = None
+    try:
+        if hasattr(websocket, "request") and websocket.request and hasattr(websocket.request, "headers"):
+            origin = websocket.request.headers.get("Origin")
+        elif hasattr(websocket, "request_headers"):
+            origin = websocket.request_headers.get("Origin")
+    except Exception:
+        pass
+
+    if origin and not WS_SESSION_MANAGER.is_origin_allowed(origin):
+        print(f"[WS SECURITY] Rejet connexion : Origine non autorisée ({origin})")
+        await websocket.close(code=4003, reason="Forbidden Origin")
+        return
+
+    # 3. Authentification et Session
+    client_ip = "127.0.0.1"
+    if websocket.remote_address and len(websocket.remote_address) > 0:
+        client_ip = websocket.remote_address[0]
+
+    is_loopback = client_ip in ("127.0.0.1", "::1", "localhost")
+    authenticated = False
+    session_id = "desktop_local"
+
+    # Si client loopback et origine locale/absente, autoriser avec session locale
+    if is_loopback and (not origin or WS_SESSION_MANAGER.is_origin_allowed(origin)):
+        authenticated = True
+        session_id = "desktop_local"
+        websocket.session_id = session_id
+
+    # Pour les connexions distantes (LAN), exiger impérativement une authentification sous 5s
+    if not authenticated:
+        try:
+            auth_msg = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+            auth_data = json.loads(auth_msg)
+            if auth_data.get("type") == "auth":
+                s_id = auth_data.get("session_id", "")
+                tok = auth_data.get("token", "")
+                if WS_SESSION_MANAGER.verify_session(s_id, tok):
+                    authenticated = True
+                    session_id = s_id
+                    websocket.session_id = session_id
+                    await websocket.send(json.dumps({"type": "auth_ok", "session_id": session_id, "message": "Authentification réussie"}))
+                else:
+                    await websocket.send(json.dumps({"type": "auth_error", "message": "Jeton d'authentification ou session invalide ou expiré"}))
+                    await websocket.close(code=4001, reason="Unauthorized")
+                    return
+            else:
+                await websocket.send(json.dumps({"type": "auth_error", "message": "Poignée de main d'authentification requise"}))
+                await websocket.close(code=4001, reason="Authentication required")
+                return
+        except Exception as e:
+            print(f"[WS SECURITY] Échec poignée de main auth client distant {client_ip} : {e}")
+            await websocket.close(code=4001, reason="Authentication timeout or failure")
+            return
+
     CONNECTED_CLIENTS.add(websocket)
     interface_deja_connectee = True
-    print(f"[WEB] Interface connectee (Clients actifs: {len(CONNECTED_CLIENTS)})")
+    print(f"[WEB] Interface connectée (Clients actifs: {len(CONNECTED_CLIENTS)}, IP: {client_ip}, Session: {session_id})")
+
+    # Suivi du débit de messages (Rate Limiting anti-DoS)
+    message_timestamps = []
+    MAX_MSG_PER_SEC = 30
+
     try:
         async for message in websocket:
+            # Vérification du débit
+            now = time.time()
+            message_timestamps = [t for t in message_timestamps if now - t < 1.0]
+            if len(message_timestamps) >= MAX_MSG_PER_SEC:
+                print(f"[WS SECURITY] Client {client_ip} dépasse le débit autorisé ({MAX_MSG_PER_SEC} msg/s)")
+                await websocket.send(json.dumps({"type": "rate_limit_warning", "message": "Trop de requêtes, ralentissez."}))
+                continue
+            message_timestamps.append(now)
+
             try:
                 data = json.loads(message)
-                if data.get("type") == "mobile_command":
+                msg_type = data.get("type")
+
+                # Support authentification explicite à la volée (ex: token rotation)
+                if msg_type == "auth":
+                    tok = data.get("token", "")
+                    if WS_SESSION_MANAGER.verify_token(tok):
+                        authenticated = True
+                        await websocket.send(json.dumps({"type": "auth_ok", "message": "Jeton valide"}))
+                    else:
+                        await websocket.send(json.dumps({"type": "auth_error", "message": "Jeton invalide"}))
+                    continue
+
+                if msg_type == "mobile_command":
                     texte = data.get("text", "").strip()
                     if texte:
-                        print(f"[MOBILE] Commande recue : {texte}")
+                        print(f"[MOBILE] Commande reçue : {texte}")
                         asyncio.ensure_future(traiter_reponse_ia(texte, mobile_ws=websocket))
-                elif data.get("type") == "stop_audio":
+
+                elif msg_type == "stop_audio":
                     global STOP_PARLER
                     STOP_PARLER = True
-                    print("[MOBILE] Signal STOP audio recu")
-                elif data.get("type") == "file_upload":
-                    filename = data.get("name", "upload_inconnu")
+                    print("[MOBILE] Signal STOP audio reçu")
+
+                elif msg_type == "file_upload":
+                    # ==========================================
+                    # SEC-02 : UPLOAD SÉCURISÉ ET ANTI PATH-TRAVERSAL
+                    # ==========================================
+                    raw_filename = data.get("name", "upload_inconnu")
                     content_b64 = data.get("content", "")
+
                     if content_b64:
-                        print(f"[WEB] Fichier recu : {filename}")
-                        # Creation d'un dossier temporaire pour l'analyse
-                        temp_dir = os.path.join(os.path.dirname(__file__), "temp_uploads")
+                        # 1. Vérification de la taille du payload base64 (max 15 Mo -> ~10 Mo décodé)
+                        MAX_B64_LEN = 15 * 1024 * 1024
+                        MAX_DECODED_BYTES = 10 * 1024 * 1024
+
+                        if len(content_b64) > MAX_B64_LEN:
+                            await websocket.send(json.dumps({
+                                "type": "upload_error",
+                                "error": "Fichier trop volumineux (dépasse 10 Mo autorisés)."
+                            }))
+                            continue
+
+                        # 2. Nettoyage strict et extraction du nom de base
+                        clean_name = os.path.basename(raw_filename.replace("\\", "/"))
+                        base, ext = os.path.splitext(clean_name)
+                        ext = ext.lower()
+
+                        # 3. Whitelist stricte d'extensions
+                        ALLOWED_EXTS = {
+                            ".txt", ".pdf", ".md", ".py", ".js", ".ts", ".html",
+                            ".css", ".json", ".csv", ".log", ".png", ".jpg", ".jpeg",
+                            ".docx", ".xlsx"
+                        }
+                        FORBIDDEN_EXTS = {
+                            ".exe", ".bat", ".cmd", ".ps1", ".vbs", ".sh", ".dll",
+                            ".com", ".scr", ".msi", ".jar", ".pif", ".reg"
+                        }
+
+                        if ext in FORBIDDEN_EXTS or (ext and ext not in ALLOWED_EXTS):
+                            await websocket.send(json.dumps({
+                                "type": "upload_error",
+                                "error": f"Type de fichier non autorisé ({ext}). Téléversement rejeté (SEC-02)."
+                            }))
+                            continue
+
+                        # 4. Génération d'un nom de stockage interne imprévisible
+                        safe_slug = re.sub(r'[^a-zA-Z0-9_\.-]', '_', base)[:50]
+                        safe_filename = f"{safe_slug}{ext}" if ext else f"{safe_slug}.txt"
+                        unique_storage_name = f"{uuid.uuid4().hex}_{safe_filename}"
+
+                        temp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "temp_uploads"))
                         os.makedirs(temp_dir, exist_ok=True)
-                        file_path = os.path.join(temp_dir, filename)
-                        
+                        file_path = os.path.join(temp_dir, unique_storage_name)
+
+                        # 5. Vérification canonique absolue contre toute traversée de répertoire
+                        real_file = os.path.realpath(file_path)
+                        real_dir = os.path.realpath(temp_dir)
+                        if not real_file.startswith(real_dir + os.sep):
+                            await websocket.send(json.dumps({
+                                "type": "upload_error",
+                                "error": "Tentative de traversée de répertoire bloquée (SEC-02)."
+                            }))
+                            continue
+
+                        # 6. Décodage sécurisé et écriture du fichier
                         try:
+                            decoded_bytes = base64.b64decode(content_b64, validate=True)
+                            if len(decoded_bytes) > MAX_DECODED_BYTES:
+                                await websocket.send(json.dumps({
+                                    "type": "upload_error",
+                                    "error": "Taille de fichier décompressée supérieure à 10 Mo."
+                                }))
+                                continue
+
                             with open(file_path, "wb") as f:
-                                f.write(base64.b64decode(content_b64))
-                            
+                                f.write(decoded_bytes)
+
+                            print(f"[WEB] Fichier téléversé en toute sécurité : {safe_filename} -> {unique_storage_name}")
                             texte_extrait = extraire_texte_doc(file_path)
                             if texte_extrait:
-                                print(f"[WEB] Texte extrait de {filename} ({len(texte_extrait)} chars)")
-                                prompt_upload = f"L'utilisateur vient de m'envoyer un fichier nommé '{filename}'. Voici son contenu :\n\n{texte_extrait}\n\nPeux-tu analyser ce fichier et confirmer à l'utilisateur que tu l'as bien lu ?"
+                                print(f"[WEB] Texte extrait de {safe_filename} ({len(texte_extrait)} chars)")
+                                prompt_upload = (
+                                    f"L'utilisateur vient de m'envoyer un fichier nommé '{safe_filename}'. "
+                                    f"Voici son contenu :\n\n{texte_extrait}\n\n"
+                                    f"Peux-tu analyser ce fichier et confirmer à l'utilisateur que tu l'as bien lu ?"
+                                )
                                 asyncio.ensure_future(traiter_reponse_ia(prompt_upload, mobile_ws=websocket))
                             else:
-                                await parler(f"J'ai bien reçu {filename}, mais je n'ai pas pu en extraire du texte.")
+                                await parler(f"J'ai bien reçu {safe_filename}, mais je n'ai pas pu en extraire du texte.")
                         except Exception as e:
-                            print(f"[WEB] Erreur upload : {e}")
-                            await parler("Désolé, une erreur est survenue lors de l'analyse du fichier.")
-                        finally:
-                            # Optionnel : garder le fichier ou le supprimer
-                            pass
+                            print(f"[WEB] Erreur upload sécurisé : {e}")
+                            await parler("Désolé, une erreur est survenue lors du traitement du fichier.")
+
+                # ==========================================
+                # CORRECTION BUG 2 : FRAME RÉCEPTION SÉPARÉE
+                # ==========================================
+                elif msg_type == "screen_frame":
                     req_id = data.get("id")
                     if req_id in PENDING_SCREEN_CAPTURES:
                         fut = PENDING_SCREEN_CAPTURES.pop(req_id)
                         if "error" in data:
                             fut.set_exception(Exception(data["error"]))
                         else:
-                            fut.set_result(data["data"])
-                    print(f"[VISION] Frame recue pour ID: {req_id}")
+                            fut.set_result(data.get("data"))
+                    print(f"[VISION] Frame reçue pour ID: {req_id}")
+
             except Exception as e:
                 print(f"[WEB] Erreur traitement message : {e}")
     except Exception:
         pass
     finally:
         CONNECTED_CLIENTS.discard(websocket)
-        print(f"[WEB] Interface deconnectee (Clients actifs: {len(CONNECTED_CLIENTS)})")
+        print(f"[WEB] Interface déconnectée (Clients actifs: {len(CONNECTED_CLIENTS)})")
 
 async def send_web_state(state):
     if CONNECTED_CLIENTS:
@@ -1052,7 +1575,37 @@ def ha_get_calendrier(entity_id):
         print(f"[HA] Erreur calendrier : {e}")
         return []
 
-def ha_lumiere(entity_id, etat="on", luminosite=None, rgb=None):
+# ==========================================
+# CONSTANTES ET VÉRIFICATION D'ÉTAT PHYSIQUE HOME ASSISTANT (C-04 / SEC-05)
+# ==========================================
+HA_REQUEST_ACCEPTED = "REQUEST_ACCEPTED"
+HA_STATE_VERIFIED   = "STATE_VERIFIED"
+HA_STATE_UNKNOWN    = "STATE_UNKNOWN"
+HA_TIMEOUT          = "TIMEOUT"
+HA_FAILED           = "FAILED"
+
+def ha_verifier_changement_etat(entity_id: str, expected_state: str, max_attempts: int = 3, interval: float = 0.4) -> Tuple[str, str]:
+    """Interroge l'état matériel réel d'une entité après une commande pour valider la transition physique (C-04)."""
+    etat_reel = "inconnu"
+    for attempt in range(max_attempts):
+        etat_reel = ha_get_etat(entity_id)
+        if isinstance(etat_reel, str):
+            etat_norm = etat_reel.strip().lower()
+            exp_norm = expected_state.strip().lower()
+
+            if etat_norm == exp_norm:
+                return (HA_STATE_VERIFIED, etat_reel)
+
+            if etat_norm in ("unknown", "unavailable", "inconnu", "none"):
+                return (HA_STATE_UNKNOWN, etat_reel)
+
+        if attempt < max_attempts - 1:
+            time.sleep(interval)
+
+    return (HA_TIMEOUT, str(etat_reel))
+
+def ha_lumiere(entity_id, etat="on", luminosite=None, rgb=None, verify_state=True):
+    """Commande une lumière Home Assistant avec vérification d'état physique réelle (C-04)."""
     service_name = "toggle" if etat == "toggle" else ("turn_on" if etat == "on" else "turn_off")
     donnees = {}
     if etat == "on":
@@ -1060,11 +1613,31 @@ def ha_lumiere(entity_id, etat="on", luminosite=None, rgb=None):
             donnees["brightness"] = int(luminosite)
         if rgb is not None:
             donnees["rgb_color"] = rgb
-    return ha_appeler_service("light", service_name, entity_id, donnees)
 
-def ha_interrupteur(entity_id, etat="on"):
+    service_ok = ha_appeler_service("light", service_name, entity_id, donnees)
+    if not service_ok:
+        return {"status": HA_FAILED, "state": "unknown"}
+
+    if not verify_state or etat == "toggle":
+        return {"status": HA_REQUEST_ACCEPTED, "state": "unknown"}
+
+    expected = "on" if etat == "on" else "off"
+    status, actual_state = ha_verifier_changement_etat(entity_id, expected, max_attempts=3, interval=0.4)
+    return {"status": status, "state": actual_state}
+
+def ha_interrupteur(entity_id, etat="on", verify_state=True):
+    """Commande un interrupteur/prise Home Assistant avec vérification d'état physique réelle (C-04)."""
     service_name = "turn_on" if etat == "on" else "turn_off"
-    return ha_appeler_service("switch", service_name, entity_id)
+    service_ok = ha_appeler_service("switch", service_name, entity_id)
+    if not service_ok:
+        return {"status": HA_FAILED, "state": "unknown"}
+
+    if not verify_state:
+        return {"status": HA_REQUEST_ACCEPTED, "state": "unknown"}
+
+    expected = "on" if etat == "on" else "off"
+    status, actual_state = ha_verifier_changement_etat(entity_id, expected, max_attempts=3, interval=0.4)
+    return {"status": status, "state": actual_state}
 
 def ha_thermostat(entity_id, temperature):
     return ha_appeler_service("climate", "set_temperature", entity_id, {"temperature": temperature})
@@ -1596,9 +2169,179 @@ def lancer_app(nom_app: str) -> str:
     return f"Je n'ai pas trouvé '{nom_app}' sur votre PC. Vérifiez que l'application est bien installée."
 
 
-def executer_action_pc(commande):
+# ==========================================
+# GESTIONNAIRE D'ACTIONS SYSTÈME SÉCURISÉES (SEC-03)
+# ==========================================
+class SystemActionController:
+    """Contrôleur sécurisé pour l'arrêt, le redémarrage et les commandes PC critiques."""
+
+    def __init__(self):
+        # Isolation multi-sessions (SEC-03) : session_id -> {"action": "shutdown"|"reboot", "expires_at": float, "token": str}
+        self.pending_actions: Dict[str, Dict[str, Any]] = {}
+        self.timeout_seconds = 30.0
+        self.log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alice_outputs", "security_audit.log")
+        self._ensure_log_dir()
+
+    def _ensure_log_dir(self):
+        try:
+            os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        except Exception:
+            pass
+
+    def log_audit(self, event_type: str, details: str, client_ip: str = "local", session_id: str = "unknown"):
+        """Enregistre un événement de sécurité dans le journal d'audit."""
+        try:
+            self._ensure_log_dir()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry = f"[{ts}] [SEC-AUDIT] [{event_type}] [SESSION:{session_id}] [IP:{client_ip}] {details}\n"
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception as e:
+            print(f"[SEC-AUDIT ERROR] {e}")
+
+    def is_domotique_intent(self, cmd: str) -> bool:
+        """Détecte si la commande vise un équipement domotique plutôt que le PC."""
+        domotique_keywords = [
+            "lumiere", "lumière", "lumieres", "lumières", "lampe", "lampes", "spot", "spots",
+            "prise", "prises", "interrupteur", "tele", "télé", "television", "télévision", "tv",
+            "salon", "chambre", "cuisine", "couloir", "bureau", "salle", "bain", "garage",
+            "clim", "climatisation", "chauffage", "radiateur", "thermostat", "alarme", "volet", "volets"
+        ]
+        return any(kw in cmd for kw in domotique_keywords)
+
+    def is_thought_or_conditional(self, cmd: str) -> bool:
+        """Détecte les réflexions, hésitations ou hypothèses sans ordre impératif direct."""
+        thoughts = [
+            "je pense", "j'hésite", "j'aimerais peut-être", "peut-être", "est-ce que tu dois",
+            "faudrait-il", "envisage", "pourquoi", "si j'éteins"
+        ]
+        return any(t in cmd for t in thoughts)
+
+    def is_negation(self, cmd: str) -> bool:
+        """Détecte les négations ou annulations verbales."""
+        negations = [
+            "ne veux pas", "pas éteindre", "pas eteindre", "n'éteins pas", "n'eteins pas",
+            "ne pas", "annule", "annuler", "stop l'extinction"
+        ]
+        return any(neg in cmd for neg in negations)
+
+    def process_command(self, cmd: str, session_id: str = "desktop_local", client_ip: str = "local") -> Optional[str]:
+        """Analyse et traite les commandes système avec isolation de session stricte (SEC-03)."""
+        cmd_clean = cmd.strip().lower()
+
+        # 1. Annulation explicite
+        if "annul" in cmd_clean:
+            if session_id in self.pending_actions:
+                action = self.pending_actions[session_id]["action"]
+                del self.pending_actions[session_id]
+                self.log_audit("ACTION_CANCELLED", f"Action {action} annulée", client_ip, session_id)
+                return "Opération système annulée. L'ordinateur restera allumé."
+            return "Aucune action à annuler pour votre session."
+
+        # 2. Confirmation d'une action en attente
+        if "confirmer" in cmd_clean or "confirme" in cmd_clean:
+            if session_id not in self.pending_actions:
+                # Vérifier si une AUTRE session a une confirmation en cours (protection cross-session !)
+                if self.pending_actions:
+                    self.log_audit("CROSS_SESSION_ATTEMPT", "Tentative de confirmation croisée rejetée", client_ip, session_id)
+                    return "Action non autorisée : la confirmation d'extinction doit provenir de la même session que la demande initiale."
+                return "Aucune commande système sensible n'est actuellement en attente de confirmation pour votre session."
+
+            now = time.time()
+            action_data = self.pending_actions[session_id]
+            if now > action_data["expires_at"]:
+                expired_action = action_data["action"]
+                del self.pending_actions[session_id]
+                self.log_audit("ACTION_EXPIRED", f"Action {expired_action} expirée après 30s", client_ip, session_id)
+                return "Le délai de confirmation de 30 secondes a expiré. L'action est annulée par sécurité."
+
+            action = action_data["action"]
+            # Vérifier la correspondance de l'action sans ambiguïté
+            if action == "shutdown":
+                if any(kw in cmd_clean for kw in ["redemarr", "redémarr", "reboot"]):
+                    return "Confirmation ambiguë rejetée : l'action en attente est une extinction, pas un redémarrage."
+                if not any(kw in cmd_clean for kw in ["eteindre", "éteindre", "extinction", "confirmer", "confirme"]):
+                    return "Confirmation ambiguë rejetée. Dites exactement 'confirmer l'extinction' pour valider."
+            elif action == "reboot":
+                if any(kw in cmd_clean for kw in ["eteindre", "éteindre", "extinction"]):
+                    return "Confirmation ambiguë rejetée : l'action en attente est un redémarrage, pas une extinction."
+                if not any(kw in cmd_clean for kw in ["redemarr", "redémarr", "reboot", "confirmer", "confirme"]):
+                    return "Confirmation ambiguë rejetée. Dites exactement 'confirmer le redémarrage' pour valider."
+
+            del self.pending_actions[session_id]
+            self.log_audit("ACTION_CONFIRMED", f"Action {action} validée et déclenchée", client_ip, session_id)
+
+            # Mode DRY-RUN pour les tests automatisés sans interruption OS réelle
+            if os.environ.get("JARVIS_DRY_RUN_SYSTEM_COMMANDS") == "1":
+                return f"[DRY-RUN] Commande {action} confirmée avec succès. Aucune interruption OS réelle appliquée."
+
+            if action == "shutdown":
+                try:
+                    subprocess.Popen(["shutdown", "/s", "/t", "10", "/c", "Extinction validée via ALICE"])
+                    return "Extinction du système confirmée. L'ordinateur va s'éteindre dans 10 secondes."
+                except Exception as e:
+                    return f"Erreur lors de l'exécution de l'extinction : {e}"
+            elif action == "reboot":
+                try:
+                    subprocess.Popen(["shutdown", "/r", "/t", "10", "/c", "Redémarrage validé via ALICE"])
+                    return "Redémarrage du système confirmé. L'ordinateur va redémarrer dans 10 secondes."
+                except Exception as e:
+                    return f"Erreur lors de l'exécution du redémarrage : {e}"
+
+        # 3. Élimination des conflits domotiques, négations et simples pensées
+        if self.is_domotique_intent(cmd_clean):
+            return None
+
+        if self.is_thought_or_conditional(cmd_clean):
+            return None
+
+        if self.is_negation(cmd_clean):
+            return None
+
+        # 4. Détection stricte d'intention d'arrêt ou reboot PC
+        pattern_shutdown = re.compile(
+            r'\b(?:éteins|eteins|éteindre|eteindre|arrête|arrete|arrêter|arreter|stop)\s+(?:le\s+|l\'|l\s+|mon\s+|cet\s+|ce\s+)?(?:pc|ordinateur|ordi|machine|windows)\b'
+        )
+        pattern_reboot = re.compile(
+            r'\b(?:redémarre|redemarre|redémarrer|redemarrer|reboot|relance|relancer)\s+(?:le\s+|l\'|l\s+|mon\s+|cet\s+|ce\s+)?(?:pc|ordinateur|ordi|machine|windows)\b'
+        )
+
+        if pattern_shutdown.search(cmd_clean):
+            self.pending_actions[session_id] = {
+                "action": "shutdown",
+                "expires_at": time.time() + self.timeout_seconds,
+                "token": secrets.token_hex(4)
+            }
+            self.log_audit("ACTION_PENDING", "Demande d'extinction PC en attente de confirmation (30s)", client_ip, session_id)
+            return (
+                "Êtes-vous certain de vouloir éteindre votre ordinateur ? "
+                "Pour confirmer, dites 'confirmer l'extinction' dans les 30 secondes. Sinon dites 'annuler'."
+            )
+
+        if pattern_reboot.search(cmd_clean):
+            self.pending_actions[session_id] = {
+                "action": "reboot",
+                "expires_at": time.time() + self.timeout_seconds,
+                "token": secrets.token_hex(4)
+            }
+            self.log_audit("ACTION_PENDING", "Demande de redémarrage PC en attente de confirmation (30s)", client_ip, session_id)
+            return (
+                "Êtes-vous certain de vouloir redémarrer votre ordinateur ? "
+                "Pour confirmer, dites 'confirmer le redémarrage' dans les 30 secondes. Sinon dites 'annuler'."
+            )
+
+        return None
+
+SYSTEM_ACTION_CONTROLLER = SystemActionController()
+
+def executer_action_pc(commande, session_id="desktop_local", client_ip="local"):
     cmd          = commande.lower()
     user_profile = os.environ.get('USERPROFILE', '')
+
+    # --- SÉCURITÉ SYSTÈME (SEC-03 : Arrêt, Redémarrage & Audit avec isolation de session) ---
+    sys_action_result = SYSTEM_ACTION_CONTROLLER.process_command(cmd, session_id=session_id, client_ip=client_ip)
+    if sys_action_result is not None:
+        return sys_action_result
 
     # --- ACTIONS DE FICHIERS (Nouveau) ---
     # Lis le fichier C:\test.txt
@@ -1678,10 +2421,6 @@ def executer_action_pc(commande):
         pyautogui.screenshot(path)
         return "Screenshot sauvegardé sur votre bureau."
 
-    if "eteins" in cmd or "shutdown" in cmd:
-        os.system("shutdown /s /t 5")
-        return "Extinction du système dans 5 secondes."
-
     return None
 
 def init_mixer():
@@ -1711,41 +2450,17 @@ def diagnostic_pc():
     except: return None
 
 def memory_add(cle, valeur):
-    """Enregistre un fait dans la mémoire long terme d'Alice."""
+    """Enregistre un fait dans la mémoire long terme d'Alice (thread-safe, écriture atomique)."""
     try:
-        data = {}
-        if os.path.exists("jarvis_memoire.json"):
-            with open("jarvis_memoire.json", "r", encoding="utf-8") as f:
-                data = json.load(f)
-        
-        data[cle] = {
-            "valeur": valeur,
-            "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M")
-        }
-        
-        with open("jarvis_memoire.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return True
+        return bool(ajouter_memoire(cle, valeur))
     except Exception as e:
         print(f"[MEMOIRE] Erreur ajout : {e}")
         return False
 
 def memory_forget(cle):
-    """Supprime un fait de la mémoire d'Alice."""
+    """Supprime un fait de la mémoire d'Alice (thread-safe, écriture atomique)."""
     try:
-        if not os.path.exists("jarvis_memoire.json"): return False
-        with open("jarvis_memoire.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # Recherche floue ou exacte
-        keys_to_del = [k for k in data.keys() if cle.lower() in k.lower()]
-        if not keys_to_del: return False
-        
-        for k in keys_to_del: del data[k]
-        
-        with open("jarvis_memoire.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return True
+        return bool(supprimer_memoire(cle))
     except Exception as e:
         print(f"[MEMOIRE] Erreur oubli : {e}")
         return False
@@ -2485,6 +3200,14 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
         await parler(reponse)
         return
 
+    # 1.1 ACTIONS SYSTÈME ET CONTRÔLE PC (SEC-03 avec isolation de session)
+    session_id = getattr(mobile_ws, "session_id", "desktop_local") if mobile_ws else "desktop_local"
+    client_ip = mobile_ws.remote_address[0] if (mobile_ws and mobile_ws.remote_address and len(mobile_ws.remote_address) > 0) else "local"
+    action_pc = executer_action_pc(texte_utilisateur, session_id=session_id, client_ip=client_ip)
+    if action_pc:
+        await parler(action_pc)
+        return
+
     # 2. SOURCE IA (Streaming)
     stream_gen = None
     t_lower = texte_utilisateur.lower()
@@ -2668,30 +3391,48 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
                 luminosite = data.get("luminosite", None)
                 entity_id  = PIECES_LUMIERES.get(piece, f"light.{piece}")
                 rgb        = COULEURS_MAP.get(couleur) if couleur else None
-                ha_lumiere(entity_id, etat, luminosite, rgb)
+                result     = ha_lumiere(entity_id, etat, luminosite, rgb, verify_state=True)
                 
-                # Message de confirmation amélioré
-                if etat == "off":
-                    msg = f"J'éteins {piece}."
-                else:
-                    details = []
-                    if couleur: details.append(f"en {couleur}")
-                    if luminosite is not None: 
-                        pourcent = int((int(luminosite)/255)*100)
-                        details.append(f"à {pourcent}%")
-                    
-                    if details:
-                        msg = f"C'est fait, {piece} est réglé{' '.join(details)}."
+                status = result.get("status") if isinstance(result, dict) else (HA_STATE_VERIFIED if result else HA_FAILED)
+                actual_state = result.get("state") if isinstance(result, dict) else "unknown"
+
+                # C-04 / SEC-05 : Distinguo strict entre acceptation et état physique vérifié
+                if status == HA_FAILED:
+                    await parler(f"Impossible d'actionner la lumière de {piece} : la commande Home Assistant a échoué ou l'appareil est injoignable.")
+                elif status == HA_STATE_VERIFIED:
+                    if etat == "off":
+                        msg = f"J'éteins {piece}. État physique vérifié : éteinte."
                     else:
-                        msg = f"Lumière {piece} allumée."
-                await parler(msg)
+                        details = []
+                        if couleur: details.append(f"en {couleur}")
+                        if luminosite is not None: 
+                            pourcent = int((int(luminosite)/255)*100)
+                            details.append(f"à {pourcent}%")
+                        det_str = f" {' '.join(details)}" if details else ""
+                        msg = f"C'est fait, lumière {piece} allumée{det_str}. État matériel vérifié."
+                    await parler(msg)
+                elif status == HA_STATE_UNKNOWN:
+                    await parler(f"L'ordre pour la lumière de {piece} a été transmis, mais l'état réel de l'ampoule reste indéterminé.")
+                else: # TIMEOUT ou REQUEST_ACCEPTED avec état non confirmé
+                    await parler(f"Attention : l'ordre a été envoyé à Home Assistant, mais l'appareil {piece} signale toujours l'état : {actual_state}.")
+
             elif action == "ha_prise":
-                piece     = data.get("piece", "bureau")
-                etat      = data.get("etat",  "on")
-                entity_id = PIECES_PRISES.get(piece, f"switch.prise_{piece}")
-                ha_interrupteur(entity_id, etat)
-                msg = f"Prise {piece} {'activée' if etat == 'on' else 'désactivée'}."
-                await parler(msg)
+                piece        = data.get("piece", "bureau")
+                etat         = data.get("etat",  "on")
+                entity_id    = PIECES_PRISES.get(piece, f"switch.prise_{piece}")
+                result       = ha_interrupteur(entity_id, etat, verify_state=True)
+                status       = result.get("status") if isinstance(result, dict) else (HA_STATE_VERIFIED if result else HA_FAILED)
+                actual_state = result.get("state") if isinstance(result, dict) else "unknown"
+
+                if status == HA_FAILED:
+                    await parler(f"Impossible d'actionner la prise de {piece} : la commande Home Assistant a échoué.")
+                elif status == HA_STATE_VERIFIED:
+                    msg = f"Prise {piece} {'activée' if etat == 'on' else 'désactivée'}. État matériel vérifié."
+                    await parler(msg)
+                elif status == HA_STATE_UNKNOWN:
+                    await parler(f"L'ordre pour la prise {piece} a été transmis, mais l'état réel de l'équipement reste indéterminé.")
+                else:
+                    await parler(f"Attention : l'ordre a été envoyé pour la prise {piece}, mais l'équipement signale toujours l'état : {actual_state}.")
             elif action == "ha_temperature":
                 piece     = data.get("piece", "salon")
                 entity_id = PIECES_CAPTEURS.get(piece)
@@ -2728,26 +3469,56 @@ async def traiter_reponse_ia(texte_utilisateur, mobile_ws=None):
                     await parler(f"Je n'ai pas l'appareil {appareil} dans ma liste de batterie.")
             elif action == "ha_thermostat":
                 temp = data.get("temperature", 20)
-                ha_thermostat("climate.thermostat", temp)
-                await parler(f"Thermostat réglé à {temp} degrés.")
+                success = ha_thermostat("climate.thermostat", temp)
+                if not success:
+                    await parler(f"Impossible de régler le thermostat à {temp} degrés. La commande Home Assistant a échoué.")
+                else:
+                    await parler(f"Thermostat réglé à {temp} degrés.")
             elif action == "ha_scene":
                 nom      = data.get("nom", "")
                 scene_id = f"scene.{nom}"
-                ha_scene(scene_id)
-                await parler(f"Ambiance {nom} activée.")
+                success  = ha_scene(scene_id)
+                if not success:
+                    await parler(f"Impossible d'activer l'ambiance {nom}. La commande Home Assistant a échoué.")
+                else:
+                    await parler(f"Ambiance {nom} activée.")
             elif action == "ha_alarme":
                 etat = data.get("etat", "on")
+                alarm_entity = "alarm_control_panel.home_base_2"
                 if etat == "on":
-                    ha_appeler_service("alarm_control_panel", "alarm_arm_away", "alarm_control_panel.home_base_2")
-                    await parler("Alarme activée.")
+                    service_ok = ha_appeler_service("alarm_control_panel", "alarm_arm_away", alarm_entity)
+                    if not service_ok:
+                        await parler("Impossible d'armer l'alarme : la requête vers Home Assistant a échoué.")
+                    else:
+                        # Vérification de l'état physique réel (SEC-05 : REQUEST_ACCEPTED != STATE_VERIFIED)
+                        etat_reel = ha_get_etat(alarm_entity)
+                        if etat_reel in ["armed_away", "armed_home", "armed_night", "arming", "pending"]:
+                            await parler(f"Alarme armée avec succès. État de la centrale vérifié : {etat_reel}.")
+                        elif etat_reel in ["unknown", "inconnu"]:
+                            await parler("Ordre d'armement transmis à Home Assistant, mais l'état physique de la centrale reste indéterminé.")
+                        else:
+                            await parler(f"Alerte : l'ordre d'armement a été transmis, mais la centrale signale l'état suivant : {etat_reel}.")
                 else:
-                    ha_appeler_service("alarm_control_panel", "alarm_disarm", "alarm_control_panel.home_base_2")
-                    await parler("Alarme désactivée.")
+                    service_ok = ha_appeler_service("alarm_control_panel", "alarm_disarm", alarm_entity)
+                    if not service_ok:
+                        await parler("Impossible de désarmer l'alarme : la requête vers Home Assistant a échoué.")
+                    else:
+                        # Vérification de l'état physique réel (SEC-05)
+                        etat_reel = ha_get_etat(alarm_entity)
+                        if etat_reel in ["disarmed", "disarming"]:
+                            await parler("Alarme désarmée avec succès. État physique confirmé.")
+                        elif etat_reel in ["unknown", "inconnu"]:
+                            await parler("Ordre de désarmement transmis, mais la confirmation de l'état de la centrale est en attente.")
+                        else:
+                            await parler(f"Attention : l'ordre de désarmement a été transmis, mais la centrale signale : {etat_reel}.")
             elif action == "ha_simulation":
                 etat = data.get("etat", "on")
-                ha_interrupteur("switch.simulation", etat)
-                msg = "Simulation de présence activée." if etat == "on" else "Simulation de présence désactivée."
-                await parler(msg)
+                success = ha_interrupteur("switch.simulation", etat)
+                if not success:
+                    await parler("Impossible de modifier la simulation de présence. La commande Home Assistant a échoué.")
+                else:
+                    msg = "Simulation de présence activée." if etat == "on" else "Simulation de présence désactivée."
+                    await parler(msg)
             elif action == "ha_anniversaires":
                 events = ha_get_calendrier("calendar.anniversaires")
                 if not events:
@@ -3462,14 +4233,80 @@ def start_ia():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+# ==========================================
+# CONFIGURATION TLS/WSS & SÉCURITÉ DE TRANSPORT (C-01)
+# ==========================================
+TRUSTED_PROXIES = set(os.environ.get("ALICE_TRUSTED_PROXIES", "127.0.0.1,::1").split(","))
+
+def get_ssl_context(purpose="server") -> Optional[ssl.SSLContext]:
+    """
+    Configure et charge un contexte SSL/TLS serveur pour HTTPS (port 8080) et WSS (port 8765) (C-01).
+    Prend en charge les chemins configurés par variables d'environnement ou le dossier certs/.
+    """
+    cert_path = os.environ.get("ALICE_SSL_CERT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "cert.pem")
+    key_path = os.environ.get("ALICE_SSL_KEY") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "key.pem")
+
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        try:
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            # Durcissement cryptographique : TLSv1.2 minimum requis
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            return context
+        except Exception as e:
+            print(f"[SECURITY ERROR] Échec de chargement des certificats TLS : {e}")
+            return None
+    return None
+
+def get_transport_security_mode() -> str:
+    """Détermine le mode de sécurité de transport actif de l'application (C-01)."""
+    is_prod = (
+        os.environ.get("JARVIS_ENV", "").lower() == "production"
+        or os.environ.get("ALICE_ENV", "").lower() == "production"
+        or os.environ.get("ALICE_REQUIRE_TLS", "0") == "1"
+    )
+    ssl_ctx = get_ssl_context()
+    if ssl_ctx is not None:
+        return "TLS_ENFORCED_PRODUCTION" if is_prod else "TLS_ACTIVE_DEVELOPMENT"
+    elif is_prod:
+        return "FAIL_CLOSED_TLS_REQUIRED"
+    else:
+        return "DEVELOPMENT_PLAINTEXT_DEGRADED"
+
+def get_trusted_client_ip(handler, client_address) -> str:
+    """
+    Extrait l'adresse IP cliente réelle en ne faisant confiance aux en-têtes
+    X-Forwarded-For QUE si la connexion immédiate provient de TRUSTED_PROXIES (C-01).
+    """
+    immediate_ip = client_address[0] if client_address else "unknown"
+    if immediate_ip in TRUSTED_PROXIES and hasattr(handler, "headers"):
+        forwarded = handler.headers.get("X-Forwarded-For")
+        if forwarded:
+            first_ip = forwarded.split(",")[0].strip()
+            try:
+                ipaddress.ip_address(first_ip)
+                return first_ip
+            except ValueError:
+                pass
+    return immediate_ip
+
     async def start_ws():
         liberer_port(8765)
-        print("[WEB] Serveur WebSocket demarre sur ws://0.0.0.0:8765")
+        sec_mode = get_transport_security_mode()
+
+        # Comportement Fail-Closed en production si TLS requis et manquant (C-01 / Section 3.4)
+        if sec_mode == "FAIL_CLOSED_TLS_REQUIRED":
+            print("[SECURITY FATAL] Mode production exige TLS/WSS mais aucun certificat valide n'est configuré. Démarrage WebSocket interrompu par sécurité (C-01).")
+            return
+
+        ssl_ctx = get_ssl_context()
+        proto = "wss" if ssl_ctx else "ws"
+        print(f"[WEB] Serveur WebSocket ({proto}://) démarré sur port 8765 (Mode: {sec_mode})")
         try:
-            async with websockets.serve(ws_handler, "0.0.0.0", 8765):
+            async with websockets.serve(ws_handler, "0.0.0.0", 8765, ssl=ssl_ctx, max_size=15 * 1024 * 1024):
                 await asyncio.Future()
         except Exception as e:
-            print(f"[WEB] Erreur critique démarrage serveur : {e}")
+            print(f"[WEB] Erreur critique démarrage serveur WebSocket : {e}")
 
     threading.Thread(target=lambda: asyncio.run(start_ws()), daemon=True).start()
 
@@ -3488,19 +4325,139 @@ pygame.init()
 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
 
 def start_mobile_http_server():
-    """Serveur HTTP minimal pour servir l'interface mobile sur le port 8080."""
+    """Serveur HTTP/HTTPS pour servir l'interface mobile sur le port 8080 avec appairage sécurisé (C-01 / SEC-04)."""
     import http.server
     mobile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mobile")
     if not os.path.exists(mobile_dir):
         print("[MOBILE] Dossier mobile/ introuvable, serveur non demarre.")
         return
+
+    sec_mode = get_transport_security_mode()
+    # Comportement Fail-Closed en production si TLS requis et manquant (C-01 / Section 3.4)
+    if sec_mode == "FAIL_CLOSED_TLS_REQUIRED":
+        print("[SECURITY FATAL] Mode production exige HTTPS mais aucun certificat TLS valide n'a été fourni. Serveur mobile HTTP désactivé par sécurité (C-01).")
+        return
+
+    # Génération du code d'appairage initial à usage unique (SEC-04)
+    PAIRING_MANAGER.generate_pairing_code()
+
     class MobileHandler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=mobile_dir, **kwargs)
+
+        def _set_cors_headers(self):
+            # Interdiction stricte du wildcard '*' (SEC-04)
+            origin = self.headers.get("Origin")
+            if origin and WS_SESSION_MANAGER.is_origin_allowed(origin):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Credentials", "true")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._set_cors_headers()
+            self.end_headers()
+
+        def do_GET(self):
+            # Ancien endpoint /api/auth/token supprimé et désactivé (SEC-04)
+            if self.path == "/api/auth/token":
+                self.send_response(410)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Endpoint obsolète et supprimé pour des raisons de sécurité. Utilisez /api/pair."}).encode("utf-8"))
+                return
+
+            if self.path == "/api/pair/status":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._set_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(PAIRING_MANAGER.get_status()).encode("utf-8"))
+                return
+
+            super().do_GET()
+
+        def do_POST(self):
+            client_ip = get_trusted_client_ip(self, self.client_address)
+
+            # 1. Endpoint d'appairage avec validation de PIN à usage unique (SEC-04)
+            if self.path == "/api/pair":
+                try:
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                    data = json.loads(body) if body else {}
+                    code = str(data.get("code", "")).strip()
+
+                    if PAIRING_MANAGER.consume_pairing_code(code):
+                        new_session_id = secrets.token_hex(16)
+                        new_token = secrets.token_urlsafe(32)
+                        WS_SESSION_MANAGER.register_session(
+                            session_id=new_session_id,
+                            token=new_token,
+                            client_type="mobile",
+                            client_ip=client_ip
+                        )
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self._set_cors_headers()
+                        self.end_headers()
+                        resp = {"success": True, "session_id": new_session_id, "token": new_token}
+                        self.wfile.write(json.dumps(resp).encode("utf-8"))
+                        print(f"[PAIRING] Appairage réussi pour client mobile {client_ip} (Session {new_session_id})")
+                    else:
+                        self.send_response(401)
+                        self.send_header("Content-Type", "application/json")
+                        self._set_cors_headers()
+                        self.end_headers()
+                        resp = {"success": False, "error": "Code d'appairage invalide ou expiré"}
+                        self.wfile.write(json.dumps(resp).encode("utf-8"))
+                        print(f"[PAIRING] Tentative d'appairage rejetée pour client {client_ip}")
+                except Exception as e:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": f"Requête invalide : {e}"}).encode("utf-8"))
+                return
+
+            # 2. Endpoint de révocation de session
+            if self.path == "/api/revoke_session":
+                try:
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                    data = json.loads(body) if body else {}
+                    s_id = data.get("session_id", "")
+                    tok = data.get("token", "")
+
+                    if WS_SESSION_MANAGER.revoke_session(s_id, tok):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self._set_cors_headers()
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"success": True, "message": "Session révoquée avec succès"}).encode("utf-8"))
+                    else:
+                        self.send_response(401)
+                        self.send_header("Content-Type", "application/json")
+                        self._set_cors_headers()
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"success": False, "error": "Session introuvable ou jeton invalide"}).encode("utf-8"))
+                except Exception as e:
+                    self.send_response(400)
+                    self.end_headers()
+                return
+
+            super().do_POST()
+
         def log_message(self, format, *args):
             pass  # Silencieux
+
     server = http.server.HTTPServer(("0.0.0.0", 8080), MobileHandler)
-    print("[MOBILE] Serveur HTTP demarre sur http://192.168.1.23:8080")
+    ssl_ctx = get_ssl_context()
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+        print(f"[MOBILE] Serveur HTTPS sécurisé démarré sur https://0.0.0.0:8080 (Mode: {sec_mode})")
+    else:
+        print(f"[SECURITY WARNING] Serveur HTTP démarré en clair sur http://0.0.0.0:8080 (Mode: {sec_mode}). NE PAS EXPOSER SUR UN RÉSEAU NON DE CONFIANCE.")
     server.serve_forever()
 async def demander_ia_stream(texte):
     """Générateur de texte en streaming (Gemini)."""

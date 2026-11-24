@@ -1,3 +1,9 @@
+"""
+[STANDALONE PROTOTYPE - DEPRECATED / REMEDIATED]
+Ce fichier est un prototype autonome d'agent CLI (avril 2026), non utilisé par main2.py.
+Remédié sous ALICE-P0-REMEDIATION-003 pour s'aligner rigoureusement sur l'API canonique
+de mémoire persistante thread-safe et cross-process (C-03).
+"""
 import os
 import json
 import time
@@ -29,32 +35,51 @@ class JarvisAgent:
         self.memory = self._load_memory()
 
     def _load_memory(self) -> dict:
-        if self.memory_file.exists():
-            try:
-                return json.loads(self.memory_file.read_text(encoding="utf-8"))
-            except Exception as exc:
-                logging.warning("Unable to load memory: %s", exc)
-        return {}
+        try:
+            from main2 import charger_memoire
+            return charger_memoire()
+        except Exception:
+            if self.memory_file.exists():
+                try:
+                    return json.loads(self.memory_file.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    logging.warning("Unable to load memory: %s", exc)
+            return {}
 
     def _save_memory(self) -> None:
         try:
-            self.memory_file.write_text(json.dumps(self.memory, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as exc:
-            logging.warning("Unable to save memory: %s", exc)
+            from main2 import sauvegarder_memoire
+            sauvegarder_memoire(self.memory)
+        except Exception:
+            try:
+                self.memory_file.write_text(json.dumps(self.memory, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as exc:
+                logging.warning("Unable to save memory: %s", exc)
 
     def remember(self, key: str, value: str) -> None:
-        self.memory[key] = {
-            "valeur": value,
-            "timestamp": time.strftime("%d/%m/%Y %H:%M")
-        }
-        self._save_memory()
+        try:
+            from main2 import ajouter_memoire
+            ajouter_memoire(key, value)
+            self.memory = self._load_memory()
+        except Exception:
+            self.memory[key] = {
+                "valeur": value,
+                "timestamp": time.strftime("%d/%m/%Y %H:%M")
+            }
+            self._save_memory()
 
     def forget(self, key: str) -> bool:
-        if key in self.memory:
-            del self.memory[key]
-            self._save_memory()
-            return True
-        return False
+        try:
+            from main2 import supprimer_memoire
+            res = supprimer_memoire(key)
+            self.memory = self._load_memory()
+            return bool(res)
+        except Exception:
+            if key in self.memory:
+                del self.memory[key]
+                self._save_memory()
+                return True
+            return False
 
     def memory_context(self) -> str:
         if not self.memory:
@@ -74,7 +99,7 @@ class JarvisAgent:
             "\n\nTu es connecte a Home Assistant, la domotique de Aboubakar Ibrahim Siddick. "
             "Quand Aboubakar Ibrahim Siddick parle de lumieres, prises, chauffage, temperature, "
             "scenes ou alarme, tu DOIS generer une commande JSON. "
-            "Pour CES demandes domotiques UNIQUEMENT, reponds avec le JSON."\n
+            "Pour CES demandes domotiques UNIQUEMENT, reponds avec le JSON.\n"
         )
         return base
 

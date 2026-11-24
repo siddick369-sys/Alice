@@ -8,7 +8,9 @@
  */
 
 // ── Config ─────────────────────────────────────────────────────────────────
-const WS_URL = `ws://${window.location.hostname}:8765`;
+const isHttps = window.location.protocol === "https:";
+const wsProtocol = isHttps ? "wss:" : "ws:";
+const WS_URL = `${wsProtocol}//${window.location.hostname}:8765`;
 const RECONNECT_DELAY_MS = 2500;
 const SPEECH_LANG = "fr-FR";
 
@@ -23,6 +25,12 @@ const micIcon      = micBtn.querySelector(".mic-icon");
 const stopIcon     = micBtn.querySelector(".stop-icon");
 const micLabelEl   = document.getElementById("mic-label");
 const stopJarvisBtn= document.getElementById("stop-jarvis-btn");
+
+// ── DOM Refs Appairage (SEC-04) ─────────────────────────────────────────────
+const pairingModalEl   = document.getElementById("pairing-modal");
+const pairingInputEl   = document.getElementById("pairing-code-input");
+const pairingSubmitBtn = document.getElementById("pairing-submit-btn");
+const pairingErrorEl   = document.getElementById("pairing-error");
 
 // ── ORB 3D ──────────────────────────────────────────────────────────────────
 let orb = null;
@@ -120,20 +128,123 @@ function setConnected(ok) {
 }
 setConnected(false);
 
+// ── Appairage Sécurisé (SEC-04) ──────────────────────────────────────────────
+function showPairingModal(errorMessage = "") {
+  if (pairingModalEl) {
+    pairingModalEl.style.display = "flex";
+    if (pairingInputEl) {
+      pairingInputEl.value = "";
+      pairingInputEl.focus();
+    }
+    if (pairingErrorEl) {
+      if (errorMessage) {
+        pairingErrorEl.textContent = errorMessage;
+        pairingErrorEl.style.display = "block";
+      } else {
+        pairingErrorEl.style.display = "none";
+      }
+    }
+  }
+}
+
+function hidePairingModal() {
+  if (pairingModalEl) {
+    pairingModalEl.style.display = "none";
+  }
+}
+
+async function submitPairingCode() {
+  const code = pairingInputEl ? pairingInputEl.value.trim() : "";
+  if (!code || code.length !== 6) {
+    if (pairingErrorEl) {
+      pairingErrorEl.textContent = "Le code doit comporter 6 chiffres.";
+      pairingErrorEl.style.display = "block";
+    }
+    return;
+  }
+  try {
+    if (pairingSubmitBtn) pairingSubmitBtn.disabled = true;
+    const resp = await fetch("/api/pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code })
+    });
+    const result = await resp.json();
+    if (resp.ok && result.success && result.session_id && result.token) {
+      localStorage.setItem("jarvis_session_id", result.session_id);
+      localStorage.setItem("jarvis_session_token", result.token);
+      hidePairingModal();
+      connectWS();
+    } else {
+      if (pairingErrorEl) {
+        pairingErrorEl.textContent = result.error || "Code invalide ou expiré.";
+        pairingErrorEl.style.display = "block";
+      }
+    }
+  } catch (err) {
+    if (pairingErrorEl) {
+      pairingErrorEl.textContent = "Erreur réseau lors de l'appairage.";
+      pairingErrorEl.style.display = "block";
+    }
+  } finally {
+    if (pairingSubmitBtn) pairingSubmitBtn.disabled = false;
+  }
+}
+
+if (pairingSubmitBtn) {
+  pairingSubmitBtn.addEventListener("click", submitPairingCode);
+}
+if (pairingInputEl) {
+  pairingInputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitPairingCode();
+  });
+}
+
 // ── WebSocket ───────────────────────────────────────────────────────────────
 function connectWS() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
+  const sessionId = localStorage.getItem("jarvis_session_id");
+  const token = localStorage.getItem("jarvis_session_token");
+
+  // Si pas de session enregistrée, afficher le modal d'appairage (SEC-04-C)
+  if (!sessionId || !token) {
+    setConnected(false);
+    showPairingModal();
+    return;
+  }
+
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
-    console.log("[WS] Connecté à", WS_URL);
-    setConnected(true);
+    console.log("[WS] Connecté à", WS_URL, "- Transmission du handshake d'authentification");
+    ws.send(JSON.stringify({
+      type: "auth",
+      session_id: sessionId,
+      token: token
+    }));
   });
 
   ws.addEventListener("message", (event) => {
     try {
       const data = JSON.parse(event.data);
+
+      if (data.type === "auth_ok") {
+        console.log("[WS] Authentification réussie (Session:", data.session_id, ")");
+        setConnected(true);
+        hidePairingModal();
+        return;
+      }
+
+      if (data.type === "auth_error") {
+        console.warn("[WS] Erreur authentification :", data.message);
+        localStorage.removeItem("jarvis_session_id");
+        localStorage.removeItem("jarvis_session_token");
+        setConnected(false);
+        showPairingModal("Session invalide ou expirée. Veuillez saisir un nouveau code.");
+        try { ws.close(4001, "Auth error"); } catch(e) {}
+        return;
+      }
 
       // État de l'orbe (envoyé par le backend lors de ses propres actions)
       if (data.action === "set_state" && data.state) {
@@ -164,10 +275,19 @@ function connectWS() {
     }
   });
 
-  ws.addEventListener("close", () => {
-    console.log("[WS] Déconnecté. Reconnexion dans", RECONNECT_DELAY_MS, "ms...");
+  ws.addEventListener("close", (event) => {
+    console.log("[WS] Déconnecté (Code:", event.code, ").");
     setConnected(false);
     applyState("idle");
+
+    if (event.code === 4001 || event.code === 4003) {
+      // Rejet sécurité / session expirée : ne PAS relancer de boucle de reconnexion infinie !
+      localStorage.removeItem("jarvis_session_id");
+      localStorage.removeItem("jarvis_session_token");
+      showPairingModal("Connexion refusée par le serveur. Veuillez réappairer l'appareil.");
+      return;
+    }
+
     scheduleReconnect();
   });
 
