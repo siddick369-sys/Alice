@@ -1,0 +1,27 @@
+{
+  "name": "J.A.R.V.I.S / A.L.I.C.E — Assistant Personnel",
+  "short_name": "ALICE",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "background_color": "#050508",
+  "theme_color": "#0ea5e9",
+  "orientation": "portrait",
+  "description": "Assistant personnel intelligent, multimodal, domotique et hors-ligne.",
+  "shortcuts": [
+    {
+      "name": "Mode Cinéma",
+      "short_name": "Cinéma",
+      "url": "/index.html?quick=qa_cinema"
+    },
+    {
+      "name": "Briefing du jour",
+      "short_name": "Briefing",
+      "url": "/index.html?quick=qa_briefing"
+    },
+    {
+      "name": "Note Rapide",
+      "short_name": "Note",
+      "url": "/index.html?quick=qa_quick_note"
+    }
+  ]
+}

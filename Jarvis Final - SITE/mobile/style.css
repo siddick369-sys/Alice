@@ -376,3 +376,68 @@ body.state-listening #mic-label { color: rgba(34,197,94,0.6); }
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.8; transform: scale(1.03); }
 }
+
+/* ── Barre supérieure & Tiroirs Mission 008 ── */
+#top-bar {
+  position: fixed; top: 12px; left: 12px; right: 12px;
+  display: flex; align-items: center; justify-content: space-between;
+  z-index: 120; pointer-events: none;
+}
+#top-bar > * { pointer-events: auto; }
+#top-actions { display: flex; gap: 6px; }
+.top-chip {
+  background: var(--glass); border: 1px solid rgba(76, 168, 232, 0.25);
+  color: var(--text); border-radius: 16px; padding: 6px 10px; font-size: 14px;
+  cursor: pointer; backdrop-filter: blur(10px);
+}
+.top-chip.active { border-color: var(--cyan); box-shadow: 0 0 10px var(--cyan-glow); }
+#connection-badge { position: static; }
+.role-badge { font-size: 10px; color: var(--cyan); text-transform: uppercase; letter-spacing: 1px; margin-left: 4px; }
+
+.followup-pill {
+  position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px; padding: 6px 14px;
+  background: rgba(34, 197, 94, 0.16); border: 1px solid rgba(34, 197, 94, 0.5);
+  border-radius: 20px; z-index: 115; font-size: 12px; color: #bbf7d0;
+}
+.followup-pill button {
+  background: rgba(239, 68, 68, 0.25); border: 1px solid rgba(239, 68, 68, 0.5);
+  color: #fecaca; border-radius: 12px; padding: 2px 8px; font-size: 11px; cursor: pointer;
+}
+
+.quick-actions-dock {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 6px;
+  max-width: 420px; margin: 6px auto; z-index: 20;
+}
+.qa-chip {
+  background: rgba(16, 22, 44, 0.78); border: 1px solid rgba(76, 168, 232, 0.3);
+  color: #e2e8f0; padding: 6px 11px; border-radius: 16px; font-size: 11px; cursor: pointer;
+}
+.qa-chip.qa-disabled { opacity: 0.35; cursor: not-allowed; }
+
+.drawer-modal {
+  position: fixed; inset: 0; background: rgba(5, 8, 18, 0.92); z-index: 2100;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.drawer-card {
+  background: #11162b; border: 1px solid rgba(76, 168, 232, 0.4); border-radius: 14px;
+  padding: 18px; width: 100%; max-width: 390px; max-height: 85vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px; color: #e2e8f0;
+}
+.drawer-card h3 { font-size: 16px; margin-bottom: 4px; color: #38bdf8; }
+.drawer-input {
+  width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(76,168,232,0.3);
+  background: #090c1a; color: #fff; font-size: 13px; margin-bottom: 6px;
+}
+.drawer-check { font-size: 12px; display: flex; align-items: center; gap: 6px; color: #cbd5e1; }
+.drawer-result { font-size: 12px; background: #090c1a; padding: 8px; border-radius: 8px; color: #bae6fd; white-space: pre-wrap; }
+.drawer-list { display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto; }
+.drawer-item {
+  display: flex; justify-content: space-between; align-items: center; font-size: 12px;
+  background: rgba(255,255,255,0.04); padding: 6px 10px; border-radius: 8px;
+}
+.drawer-actions { display: flex; gap: 8px; margin-top: 6px; }
+.btn-primary { flex: 1; padding: 9px; background: #0ea5e9; border: none; border-radius: 8px; color: #fff; font-weight: 600; cursor: pointer; }
+.btn-secondary { flex: 1; padding: 9px; background: #334155; border: none; border-radius: 8px; color: #fff; cursor: pointer; }
+.flag-btn { padding: 3px 8px; border-radius: 10px; border: 1px solid #38bdf8; background: transparent; color: #38bdf8; font-size: 10px; cursor: pointer; }
+.sync-status { font-size: 11px; color: #94a3b8; }

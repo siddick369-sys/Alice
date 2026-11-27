@@ -3,6 +3,15 @@
  */
 
 function createOrb(canvas) {
+  if (typeof THREE === "undefined") {
+    console.warn("[ORB] THREE.js is not loaded (offline/CDN unavailable). 3D orb fallback active.");
+    return {
+      setState() {},
+      setVolume() {},
+      triggerDemo() {},
+      destroy() {}
+    };
+  }
   let destroyed = false;
   const N = 2000;
 

@@ -43,6 +43,8 @@ jarvis_tts_*.mp3
 alice_outputs/
 temp_uploads/
 backups/
+*.lock
+*.crossprocess.lock
 
 # Heavy archives & OCR data
 Install_jarvis.zip

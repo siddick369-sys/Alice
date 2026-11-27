@@ -1,0 +1,68 @@
+{
+  "environment": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "python": "3.11.8",
+    "cpu_cores": 8,
+    "ram_total_gb": 15.78,
+    "ram_available_gb": 3.93,
+    "cpu_percent_during_bench": 52.2
+  },
+  "benchmarks": {
+    "barge_in_abort": {
+      "samples": 30,
+      "min_ms": 0.006,
+      "p50_ms": 0.007,
+      "p95_ms": 0.015,
+      "p99_ms": 0.015,
+      "max_ms": 0.015
+    },
+    "rag_index_10_docs": {
+      "samples": 10,
+      "min_ms": 50.006,
+      "p50_ms": 55.317,
+      "p95_ms": 187.578,
+      "p99_ms": 187.578,
+      "max_ms": 187.578
+    },
+    "rag_hybrid_search": {
+      "samples": 30,
+      "min_ms": 2.939,
+      "p50_ms": 3.077,
+      "p95_ms": 4.39,
+      "p99_ms": 4.423,
+      "max_ms": 4.423
+    },
+    "ocr_tesseract_receipt": {
+      "samples": 5,
+      "min_ms": 847.35,
+      "p50_ms": 902.22,
+      "p95_ms": 1038.54,
+      "p99_ms": 1038.54,
+      "max_ms": 1038.54
+    },
+    "video_sentinel_frame_320x240": {
+      "samples": 20,
+      "min_ms": 12.553,
+      "p50_ms": 22.144,
+      "p95_ms": 70.745,
+      "p99_ms": 109.749,
+      "max_ms": 109.749
+    },
+    "orchestrator_full_lifecycle": {
+      "samples": 30,
+      "min_ms": 4.01,
+      "p50_ms": 7.215,
+      "p95_ms": 12.49,
+      "p99_ms": 36.018,
+      "max_ms": 36.018
+    },
+    "mobile_offline_sync_op": {
+      "samples": 30,
+      "min_ms": 2.65,
+      "p50_ms": 4.1,
+      "p95_ms": 5.74,
+      "p99_ms": 7.12,
+      "max_ms": 7.12
+    }
+  }
+}

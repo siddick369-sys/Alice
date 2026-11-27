@@ -109,6 +109,8 @@ class JarvisVision:
     def _vision_loop(self):
         """Boucle d'analyse en arrière-plan."""
         print(f"[VISION] Surveillance active (Intervalle: {self.scan_interval}s)")
+        last_err_msg = None
+        last_err_time = 0
         while self.is_running:
             try:
                 # 1. Capture
@@ -125,13 +127,14 @@ class JarvisVision:
                 
                 # 4. Nettoyage
                 self.last_text = self.clean_text(raw_text)
-                
-                # Optionnel : Log si texte trouvé
-                # if len(self.last_text) > 10:
-                #     print(f"[VISION] {len(self.last_text)} caractères extraits.")
-                
+                last_err_msg = None
             except Exception as e:
-                print(f"[VISION ERROR] {e}")
+                now = time.time()
+                err_str = str(e)
+                if err_str != last_err_msg or (now - last_err_time > 30):
+                    print(f"[VISION ERROR] {err_str}")
+                    last_err_msg = err_str
+                    last_err_time = now
             
             time.sleep(self.scan_interval)
 

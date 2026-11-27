@@ -85,18 +85,55 @@ function connect(): void {
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
-    setConnected(true);
+    // F013-01: Ne pas déclarer connecté sur simple ouverture de socket transport.
+    // L'état 'connecte' exige la confirmation applicative auth_ok du serveur.
+    badgeLabelEl.textContent = "authentification...";
   });
 
   ws.addEventListener("message", async (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data as string) as {
+        type?: string;
         state?: string;
         action?: string;
         muted?: boolean;
         volume?: number;
         id?: string;
+        active?: boolean;
+        window_seconds?: number;
+        error?: string;
       };
+
+      if (data.type === "auth_ok") {
+        setConnected(true);
+        statusEl.textContent = "pret";
+        return;
+      }
+
+      if (data.type === "auth_error") {
+        setConnected(false);
+        statusEl.textContent = "erreur d'authentification";
+        return;
+      }
+
+      if (data.type === "command_lifecycle" && data.state) {
+        statusEl.textContent = data.action
+          ? `[${data.action}] ${data.state.toLowerCase()}`
+          : data.state.toLowerCase();
+        return;
+      }
+
+      if (data.type === "followup_state") {
+        statusEl.textContent = data.active
+          ? `ecoute continue (${data.window_seconds ?? 5}s)...`
+          : "";
+        return;
+      }
+
+      if (data.type === "barge_in_stop" || data.action === "barge_in_stop") {
+        applyState("listening");
+        return;
+      }
 
       if (data.action === "request_screen_capture") {
         const frame = await captureFrame();
@@ -161,8 +198,8 @@ function scheduleReconnect(): void {
 muteButtonEl.addEventListener("click", () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-  // Envoi du signal stop au backend
-  ws.send(JSON.stringify({ type: "stop_audio" }));
+  // Envoi du signal barge-in / stop au backend
+  ws.send(JSON.stringify({ type: "barge_in" }));
 
   // Feedback immédiat sur l'orbe
   applyState("idle");

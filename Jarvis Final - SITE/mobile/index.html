@@ -6,7 +6,9 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <title>J.A.R.V.I.S — Mobile</title>
+    <meta name="theme-color" content="#0ea5e9" />
+    <link rel="manifest" href="manifest.json" />
+    <title>A.L.I.C.E — Mobile</title>
     <link rel="stylesheet" href="style.css" />
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   </head>
@@ -15,14 +17,29 @@
     <!-- Étoiles de fond -->
     <div id="stars"></div>
 
-    <!-- Badge de connexion -->
-    <div id="connection-badge">
-      <span id="connection-dot"></span>
-      <span id="connection-label">connexion...</span>
+    <!-- Barre supérieure : Outils + Badge connexion -->
+    <div id="top-bar">
+      <div id="top-actions">
+        <button id="whisper-toggle-btn" class="top-chip" title="Mode Chuchotement">🤫</button>
+        <button id="camera-btn" class="top-chip" title="Vision / Ticket OCR">📷</button>
+        <button id="notes-drawer-btn" class="top-chip" title="Notes Hors-Ligne">📝</button>
+        <button id="ops-drawer-btn" class="top-chip" title="Diagnostic & Flags">⚙️</button>
+      </div>
+      <div id="connection-badge">
+        <span id="connection-dot"></span>
+        <span id="connection-label">connexion...</span>
+        <span id="role-badge" class="role-badge"></span>
+      </div>
     </div>
 
-    <!-- Bouton pour stopper la parole -->
-    <button id="stop-jarvis-btn" aria-label="Stopper JARVIS">
+    <!-- Indicateur Follow-Up Listen (Feature 05) -->
+    <div id="followup-pill" class="followup-pill" style="display: none;">
+      <span id="followup-label">Écoute de suivi active...</span>
+      <button id="followup-cancel-btn" type="button">Annuler</button>
+    </div>
+
+    <!-- Bouton pour stopper la parole / Barge-In (Feature 01) -->
+    <button id="stop-jarvis-btn" aria-label="Interrompre ALICE">
       <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
         <path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z" fill="currentColor" fill-opacity="0.2"/>
         <path d="M15 9H9V15H15V9Z" fill="currentColor"/>
@@ -43,9 +60,9 @@
     <!-- Modal d'appairage sécurisé (SEC-04) -->
     <div id="pairing-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(10, 12, 24, 0.95); z-index: 2000; flex-direction: column; align-items: center; justify-content: center; padding: 20px; box-sizing: border-box;">
       <div style="background: #161b33; border: 1px solid #3d5afe; border-radius: 12px; padding: 24px; max-width: 360px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.6);">
-        <h2 style="color: #fff; margin-top: 0; font-family: sans-serif; font-size: 20px;">Appairage J.A.R.V.I.S</h2>
+        <h2 style="color: #fff; margin-top: 0; font-family: sans-serif; font-size: 20px;">Appairage A.L.I.C.E</h2>
         <p style="color: #aaa; font-size: 14px; font-family: sans-serif; margin-bottom: 20px;">
-          Entrez le code PIN à 6 chiffres affiché sur le serveur ou fourni par Jarvis :
+          Entrez le code PIN à 6 chiffres affiché sur le serveur ou fourni par Alice :
         </p>
         <input id="pairing-code-input" type="text" maxlength="6" pattern="[0-9]*" inputmode="numeric" placeholder="123456" style="width: 100%; font-size: 24px; text-align: center; letter-spacing: 6px; padding: 10px; border-radius: 8px; border: 1px solid #3d5afe; background: #0b0e1e; color: #00e5ff; font-weight: bold; outline: none; box-sizing: border-box; margin-bottom: 15px;" />
         <div id="pairing-error" style="display: none; color: #ff5252; font-size: 13px; font-family: sans-serif; margin-bottom: 15px;"></div>
@@ -64,6 +81,54 @@
         <div style="display: flex; gap: 10px; justify-content: center;">
           <button id="confirm-action-btn" style="flex: 1; padding: 12px; background: #22c55e; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;">Confirmer</button>
           <button id="cancel-action-btn" style="flex: 1; padding: 12px; background: #ef4444; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer;">Annuler</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal Vision / OCR Ticket avec Prévisualisation & Confirmation (Features 16 & 17) -->
+    <input id="camera-file-input" type="file" accept="image/*" capture="environment" style="display: none;" />
+    <div id="vision-preview-modal" class="drawer-modal" style="display: none;">
+      <div class="drawer-card">
+        <h3>Analyse Visuelle / Ticket OCR</h3>
+        <img id="vision-preview-img" alt="Aperçu capture" style="max-width: 100%; max-height: 180px; border-radius: 8px; margin: 10px 0;" />
+        <input id="vision-question-input" type="text" class="drawer-input" placeholder="Question (ou laisser vide pour OCR ticket)" />
+        <label class="drawer-check"><input id="vision-receipt-mode" type="checkbox" /> Mode Ticket / Facture (OCR structuré)</label>
+        <label class="drawer-check"><input id="vision-ephemeral" type="checkbox" checked /> Supprimer l'image après analyse</label>
+        <div id="vision-result-box" class="drawer-result"></div>
+        <div class="drawer-actions">
+          <button id="vision-send-btn" class="btn-primary">Confirmer l'envoi</button>
+          <button id="vision-close-btn" class="btn-secondary">Fermer</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tiroir Notes Hors-Ligne & Conflits PWA (Feature 26) -->
+    <div id="notes-drawer" class="drawer-modal" style="display: none;">
+      <div class="drawer-card">
+        <h3>Notes & Tâches Hors-Ligne</h3>
+        <div id="sync-status-text" class="sync-status">Prêt</div>
+        <div class="note-form">
+          <input id="note-title-input" type="text" class="drawer-input" placeholder="Titre de la note..." />
+          <input id="note-content-input" type="text" class="drawer-input" placeholder="Contenu..." />
+          <button id="note-save-btn" class="btn-primary">Enregistrer</button>
+        </div>
+        <div id="notes-list" class="drawer-list"></div>
+        <div class="drawer-actions">
+          <button id="notes-sync-btn" class="btn-primary">Synchroniser</button>
+          <button id="notes-close-btn" class="btn-secondary">Fermer</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tiroir Observabilité & Feature Flags (Feature 30) -->
+    <div id="ops-drawer" class="drawer-modal" style="display: none;">
+      <div class="drawer-card">
+        <h3>Observabilité & Feature Flags</h3>
+        <div id="ops-metrics-box" class="drawer-result">Chargement...</div>
+        <div id="flags-list" class="drawer-list"></div>
+        <div class="drawer-actions">
+          <button id="ops-refresh-btn" class="btn-primary">Actualiser</button>
+          <button id="ops-close-btn" class="btn-secondary">Fermer</button>
         </div>
       </div>
     </div>
@@ -91,12 +156,15 @@
       <!-- Zone de transcription (ce que l'utilisateur a dit) -->
       <div id="user-text" class="speech-bubble user-bubble"></div>
 
-      <!-- Zone de réponse JARVIS -->
+      <!-- Zone de réponse ALICE -->
       <div id="jarvis-text" class="speech-bubble jarvis-bubble"></div>
+
+      <!-- Barre d'actions rapides configurables (Feature 27) -->
+      <div id="quick-actions-dock" class="quick-actions-dock"></div>
 
       <!-- Bouton microphone -->
       <div id="mic-area">
-        <button id="mic-btn" aria-label="Parler à JARVIS">
+        <button id="mic-btn" aria-label="Parler à ALICE">
           <svg class="mic-icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
             <rect x="9" y="2" width="6" height="12" rx="3" fill="currentColor"/>
             <path d="M5 11a7 7 0 0 0 14 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -111,7 +179,7 @@
       </div>
 
       <!-- Label bas de page -->
-      <div id="assistant-label">J.A.R.V.I.S</div>
+      <div id="assistant-label">A.L.I.C.E</div>
 
     </main>
 
